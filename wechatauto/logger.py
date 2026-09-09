@@ -4,17 +4,9 @@ import logging
 import colorama
 from pathlib import Path
 from datetime import datetime
-import sys
-import io
 
 
 colorama.init()
-
-if hasattr(sys.stdout, 'buffer'):
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
-    except Exception:
-        pass
 
 LOG_COLORS = {
     'DEBUG': colorama.Fore.CYAN,

@@ -40,7 +40,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
-STAMP_VERSION = 2  # 解密缓存 stamp 格式版本，改合并逻辑时递增以强制重建
+STAMP_VERSION = 5  # 解密缓存 stamp 格式版本，改合并逻辑时递增以强制重建
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -476,6 +476,10 @@ class WeChatDB:
         self.keys_file = keys_file or os.path.join(self.workdir, "keys.json")
         self._keys: Dict[str, bytes] = {}
         self._db_files = self._collect_db_files()
+        self._msg_shards: Dict[str, str] = {}
+        self._cache_lock = threading.RLock()
+        self._validated_cache: set = set()
+        self._cache_paths: Dict[str, str] = {}
         self.master_key: Optional[str] = None
         self.cfg_dword: Optional[int] = None
         self._load_or_extract_keys(master_key=master_key)
@@ -899,11 +903,15 @@ class WeChatDB:
               "python -m wechatauto.diagnose_keys", file=sys.stderr)
 
     def _open(self, rel: str) -> sqlite3.Connection:
+        with self._cache_lock:
+            return self._open_cached(rel)
+
+    def _open_cached(self, rel: str) -> sqlite3.Connection:
         """打开解密(并合并 -wal 增量)后的只读库。
 
         解密结果缓存到 workdir；主库或 WAL 有变化时：
         - 主库被 checkpoint 改写（mtime/size 变化）或 WAL 被重置 → 全量重建；
-        - 仅 WAL 追加了新帧 → 增量合并新帧（秒级）。
+        - WAL 追加时增量合并；固定大小 WAL 原地覆写时从头重放当前世代。
         """
         if rel not in self._keys:
             self._auto_diagnose_key_failure(rel)
@@ -914,13 +922,11 @@ class WeChatDB:
                 % (rel, self.keys_file)
             )
         src = self._db_path(rel)
-        dst = os.path.join(self.workdir, rel.replace(os.sep, "__"))
+        cache_name = rel.replace(os.sep, "__")
+        dst = self._cache_paths.get(
+            rel, os.path.join(self.workdir, cache_name)
+        )
         key = self._keys[rel]
-        src_mtime = os.path.getmtime(src)
-        src_size = os.path.getsize(src)
-        wal_path = self._wal_path(rel)
-        wal_mtime = os.path.getmtime(wal_path) if wal_path else 0.0
-        wal_size = os.path.getsize(wal_path) if wal_path else 0
         stamp = dst + ".stamp"
         old = None
         if os.path.exists(stamp):
@@ -929,9 +935,9 @@ class WeChatDB:
                     parts = f.read().split(",")
                 old = {
                     "ver": int(parts[0]),
-                    "mtime": float(parts[1]),
+                    "mtime": int(parts[1]),
                     "size": int(parts[2]),
-                    "wal_mtime": float(parts[3]),
+                    "wal_mtime": int(parts[3]),
                     "wal_size": int(parts[4]),
                     "applied": int(parts[5]),
                 }
@@ -939,36 +945,110 @@ class WeChatDB:
                     old = None
             except (ValueError, OSError, IndexError):
                 old = None
-        build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                 or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
-        attempt = 0
-        while build:
-            attempt += 1
-            full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
+
+        for attempt in range(5):
+            state = self._source_state(rel)
+            (src_mtime, src_size, wal_path, wal_mtime,
+             wal_size, wal_frames) = state
+            build = (
+                not old or not os.path.exists(dst)
+                or old["mtime"] != src_mtime or old["size"] != src_size
+                or old["wal_mtime"] != wal_mtime
+                or old["wal_size"] != wal_size
+            )
+            if not build:
+                if rel not in self._validated_cache:
+                    if self._check_merged(dst):
+                        self._validated_cache.add(rel)
+                    else:
+                        old = None
+                        continue
+                break
+            full = (not old or not os.path.exists(dst)
+                    or old["mtime"] != src_mtime or old["size"] != src_size
                     or wal_size < old["wal_size"] or wal_size == 0)
-            if full:
-                self._decrypt_file(src, dst, key)
-                applied = 0
-            else:
-                applied = old["applied"]
-            if wal_path and wal_size > self.WAL_HEADER_SZ:
-                applied = self._merge_wal(dst, wal_path, key, applied)
-            else:
-                applied = 0
-            if self._check_merged(dst):
-                build = False
-                os.makedirs(os.path.dirname(stamp), exist_ok=True)
-                with open(stamp, "w") as f:
-                    f.write("%d,%f,%d,%f,%d,%d"
-                            % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
-            elif attempt >= 3:
-                raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
-            else:
-                old = None  # 合并结果损坏 → 全量重建重试
+            tmp = "%s.tmp.%d.%d" % (dst, os.getpid(), threading.get_ident())
+            try:
+                if full:
+                    self._decrypt_file(src, tmp, key)
+                    applied = 0
+                else:
+                    shutil.copyfile(dst, tmp)
+                    # 固定大小 WAL 会原地覆写，mtime 变化时须重放当前世代。
+                    applied = (
+                        0 if old["wal_mtime"] != wal_mtime
+                        and old["wal_size"] == wal_size
+                        else old["applied"]
+                    )
+                if wal_path and wal_frames > 0:
+                    applied = self._merge_wal(
+                        tmp, wal_path, key, applied, wal_frames
+                    )
+                else:
+                    applied = 0
+                if self._source_state(rel) != state:
+                    time.sleep(0.02)
+                    continue
+                if not self._check_merged(tmp):
+                    old = None
+                    time.sleep(0.02)
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                dst = self._replace_with_retry(tmp, dst)
+                self._cache_paths[rel] = dst
+                stamp = dst + ".stamp"
+                stamp_tmp = tmp + ".stamp"
+                with open(stamp_tmp, "w") as f:
+                    f.write("%d,%d,%d,%d,%d,%d" % (
+                        STAMP_VERSION, src_mtime, src_size,
+                        wal_mtime, wal_size, applied,
+                    ))
+                self._replace_with_retry(stamp_tmp, stamp)
+                self._validated_cache.add(rel)
+                break
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        else:
+            raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _sqlite_text_factory
         return conn
+
+    @staticmethod
+    def _replace_with_retry(src: str, dst: str) -> str:
+        """Windows 杀毒扫描或刚关闭的 SQLite 句柄可能短暂占用缓存文件。"""
+        for attempt in range(5):
+            try:
+                os.replace(src, dst)
+                return dst
+            except PermissionError:
+                if attempt == 4:
+                    root, ext = os.path.splitext(dst)
+                    alternate = "%s.%d.%d.%d%s" % (
+                        root, os.getpid(), threading.get_ident(),
+                        time.time_ns(), ext,
+                    )
+                    os.replace(src, alternate)
+                    return alternate
+                time.sleep(0.05)
+
+    def _source_state(self, rel: str) -> tuple:
+        """读取构建缓存所需的源库/WAL 状态。"""
+        src = self._db_path(rel)
+        src_stat = os.stat(src)
+        wal_path = self._wal_path(rel)
+        if not wal_path:
+            return (src_stat.st_mtime_ns, src_stat.st_size, None, 0, 0, 0)
+        wal_stat = os.stat(wal_path)
+        return (
+            src_stat.st_mtime_ns, src_stat.st_size, wal_path,
+            wal_stat.st_mtime_ns, wal_stat.st_size,
+            self._wal_frame_count(wal_path),
+        )
 
     @staticmethod
     def _check_merged(dst: str) -> bool:
@@ -993,7 +1073,32 @@ class WeChatDB:
         wal = self._db_path(rel) + "-wal"
         return wal if os.path.exists(wal) else None
 
-    def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int) -> int:
+    def _wal_frame_count(self, wal_path: str) -> int:
+        """从 WAL-index 获取逻辑帧数，避免把预分配 WAL 的旧尾部当作新帧。"""
+        shm_path = wal_path[:-4] + "-shm"
+        try:
+            with open(wal_path, "rb") as f:
+                wal_salt = f.read(self.WAL_HEADER_SZ)[16:24]
+            with open(shm_path, "rb") as f:
+                headers = f.read(96)
+            first, second = headers[:48], headers[48:96]
+            if (
+                len(headers) == 96
+                and first == second
+                and first[12] == 1
+                and first[32:40] == wal_salt
+            ):
+                return struct.unpack_from("<I", first, 16)[0]
+        except OSError:
+            pass
+        # 无可用 WAL-index 时保留旧版兼容行为（非预分配 WAL）。
+        size = os.path.getsize(wal_path)
+        return max(0, (size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ)
+
+    def _merge_wal(
+        self, dst: str, wal_path: str, key: bytes,
+        from_frame: int, frame_count: int,
+    ) -> int:
         """把 -wal 中的加密帧按页号覆盖进已解密的主库文件，返回已应用帧数。
 
         帧结构（WCDB，全部大端）：[0:4] 页号, [4:8] 提交标记, [8:16] salt, [16:24] 校验。
@@ -1014,7 +1119,8 @@ class WeChatDB:
                 wal_hdr = wal.read(self.WAL_HEADER_SZ)
                 wal_salt = wal_hdr[16:24]
                 wal_size = os.path.getsize(wal_path)
-                n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
+                physical = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
+                n = min(frame_count, physical)
                 for i in range(from_frame, n):
                     wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
                     hdr = wal.read(24)
@@ -1022,9 +1128,9 @@ class WeChatDB:
                     if len(page) < PAGE_SZ:
                         break
                     pgno = struct.unpack(">I", hdr[:4])[0]
-                    last = i + 1
                     if hdr[8:16] != wal_salt:
-                        continue
+                        break
+                    last = i + 1
                     pt = _decrypt_page(key, page, pgno)
                     if pgno == 1:
                         # 明文头模式（48B key）页 1 解密后保留明文头，
@@ -1102,6 +1208,7 @@ class WeChatDB:
         if current == self._db_files:
             return
         self._db_files = current
+        self._msg_shards.clear()
         new_rels = [
             rel for rel, path, _ in current
             if rel not in self._keys or not self._key_works(rel)
@@ -1119,16 +1226,24 @@ class WeChatDB:
 
     def _find_msg_table(self, user: str, conns: List[sqlite3.Connection]) -> Optional[Tuple[sqlite3.Connection, str]]:
         target = "Msg_" + _md5_hex(user.encode())
+        found = None
+        latest_seq = -1
         for conn in conns:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (target,),
             ).fetchone()
             if row:
-                return conn, target
-        return None
+                row = conn.execute(
+                    "SELECT MAX(sort_seq) FROM %s" % target
+                ).fetchone()
+                seq = row[0] if row and row[0] is not None else -1
+                if seq > latest_seq:
+                    found = (conn, target)
+                    latest_seq = seq
+        return found
 
-    def _invalidate_cache(self) -> None:
+    def _invalidate_cache(self, rel: Optional[str] = None) -> None:
         """删除 workdir 中全部解密缓存(.db/.stamp)，key 缓存除外。
 
         下一次 _open 会对每份库全量解密重建。media 图片等副产物不受影响。
@@ -1137,45 +1252,60 @@ class WeChatDB:
             names = os.listdir(self.workdir)
         except OSError:
             return
+        prefix = (
+            os.path.splitext(rel.replace(os.sep, "__"))[0]
+            if rel else None
+        )
         removed = 0
         for n in names:
-            if n.endswith(".db") or n.endswith(".stamp"):
+            if (
+                (n.endswith(".db") or n.endswith(".stamp"))
+                and (prefix is None or n.startswith(prefix))
+            ):
                 try:
                     os.remove(os.path.join(self.workdir, n))
                     removed += 1
                 except OSError:
                     pass
-        if removed:
-            sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
+        if rel:
+            self._validated_cache.discard(rel)
+            self._cache_paths.pop(rel, None)
+        else:
+            self._validated_cache.clear()
 
     def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
         """打开消息库并定位用户消息表（调用方负责 close 连接）"""
-        conns = []
-        try:
-            conns = [self._open(rel) for rel in self._message_dbs()]
-            found = self._find_msg_table(user, conns)
-        except sqlite3.DatabaseError as exc:
-            for c in conns:
-                c.close()
-            if _retry and _is_malformed(exc):
-                sys.stderr.write("[wechatauto] 消息库损坏(%s)，清缓存重建并重试\n" % exc)
-                self._invalidate_cache()
-                return self._msg_conn(user, _retry=False)
-            raise
-        except Exception:
-            for c in conns:
-                c.close()
-            raise
-        if not found:
-            for c in conns:
-                c.close()
-            return None
-        # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
-        target = found[0]
-        for c in conns:
-            if c is not target:
-                c.close()
-        return found
+        cached = self._msg_shards.get(user)
+        rels = self._message_dbs()
+        if cached in rels:
+            rels = [cached]
+        else:
+            # 分片编号越大越新；命中后缓存，避免每个会话都扫描全部历史分片。
+            rels.reverse()
+        for rel in rels:
+            conn = None
+            keep = False
+            try:
+                conn = self._open(rel)
+                found = self._find_msg_table(user, [conn])
+                if found:
+                    self._msg_shards[user] = rel
+                    keep = True
+                    return found
+            except sqlite3.DatabaseError as exc:
+                if _retry and _is_malformed(exc):
+                    conn.close()
+                    conn = None
+                    self._invalidate_cache(rel)
+                    return self._msg_conn(user, _retry=False)
+                raise
+            finally:
+                if conn is not None and not keep:
+                    conn.close()
+        if cached:
+            self._msg_shards.pop(user, None)
+            return self._msg_conn(user, _retry)
+        return None
 
     def _run_msg_query(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
@@ -1195,10 +1325,7 @@ class WeChatDB:
             except sqlite3.DatabaseError as exc:
                 if attempt or not _is_malformed(exc):
                     raise
-                sys.stderr.write(
-                    "[wechatauto] 查询到库损坏(%s)，清缓存重建并重试\n" % exc
-                )
-                self._invalidate_cache()
+                self._invalidate_cache(self._msg_shards.get(user))
             finally:
                 conn.close()
         return None
@@ -1298,6 +1425,9 @@ class WeChatDB:
                 if cc_text != placeholder:
                     content = cc_text
         sender_id = r["real_sender_id"]
+        source = r["source"]
+        if isinstance(source, bytes):
+            source = WeChatDB._friendly_content(source, "文本")
         sender_username = ""
         if sender_id and sender_id != 2:
             sender_index = self._sender_id_index()
@@ -1312,6 +1442,7 @@ class WeChatDB:
             "sender_username": sender_username,
             "create_time": r["create_time"],
             "content": content,
+            "source": source or "",
             "sort_seq": r["sort_seq"],
         }
 
@@ -2004,12 +2135,15 @@ class Listener:
         self._worker_threads: Dict[str, threading.Thread] = {}
         self._workers_lock = threading.Lock()
 
-    def add_listener(self, user: str, callback: callable) -> None:
+    def add_listener(self, user: str, callback: callable,
+                     since_seq: Optional[int] = None) -> None:
         """注册新消息回调：callback(msg: dict, listener)"""
         self._callbacks.setdefault(user, []).append(callback)
         if user not in self._watermark:
-            msgs = self.db.get_messages(user, limit=1)
-            self._watermark[user] = msgs[0]["sort_seq"] if msgs else 0
+            if since_seq is None:
+                msgs = self.db.get_messages(user, limit=1)
+                since_seq = msgs[0]["sort_seq"] if msgs else 0
+            self._watermark[user] = since_seq
 
     def remove_listener(self, user: str, callback: callable) -> None:
         try:
@@ -2077,7 +2211,9 @@ class Listener:
                 for s in sessions:
                     username = s["username"]
                     if username not in self._callbacks:
-                        self.add_listener(username, self._all_callback)
+                        # 新会话首次出现时通常已经带有第一条消息，从 0 开始读取
+                        # 才不会被 add_listener 的“从当前最新开始”基线跳过。
+                        self.add_listener(username, self._all_callback, since_seq=0)
             except Exception:
                 pass
         for user, callbacks in list(self._callbacks.items()):

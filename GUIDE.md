@@ -360,9 +360,9 @@ for lid in ids:
 命令行也有现成脚本 / There is also a CLI demo：
 
 ```bash
-python demo_media.py 群名 --images 100        # 下载该群最近 100 张图片
-python demo_media.py 群名 --images 100000     # 超过总数即全部 / all if > total
-python demo_media.py 文件传输助手 --filter 图片,文件
+python -m wechatauto.examples.demo_media 群名 --images 100        # 下载该群最近 100 张图片
+python -m wechatauto.examples.demo_media 群名 --images 100000     # 超过总数即全部 / all if > total
+python -m wechatauto.examples.demo_media 文件传输助手 --filter 图片,文件
 ```
 
 ---
@@ -383,8 +383,8 @@ for feed in moments.get_moments(limit=10):
     print("  saved:", saved)
 ```
 
-朋友圈图片/视频下载的完整命令行示例见 `wechatauto/demo_moments_download.py`
-（`python -m wechatauto.demo_moments_download [N] --out 目录`）。
+朋友圈图片/视频下载的完整命令行示例见 `wechatauto/examples/demo_moments_download.py`
+（`python -m wechatauto.examples.demo_moments_download [N] --out 目录`）。
 
 **点赞 / 评论（UIA 控件路线）**：点赞/评论属服务端行为，需走界面（数据库路线只读）。
 `WeChat` 会热激活 `mmui` UIA 树并点击导航栏“朋友圈”后，基于 UIA 控件操作：
@@ -404,7 +404,7 @@ moments.Comment(items[0], "不错！")                # 评论
 moments.Comment(items[0], "谢谢！", reply_to="张三")   # 回复某人评论
 ```
 
-命令行示例：`python -m wechatauto.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
+命令行示例：`python -m wechatauto.examples.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
 （直接运行则只列出最新动态，不操作界面）。
 
 ---
@@ -588,4 +588,4 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 
 - [README（英文 / English）](README.md)
 - [README（中文 / 中文）](README.zh-CN.md)
-- `wechatauto/demo_*.py` —— 各功能的可运行示例 / runnable demos
+- `wechatauto/examples/demo_*.py` —— 各功能的可运行示例 / runnable demos

@@ -29,6 +29,7 @@ except Exception:
     pass
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except AttributeError:
     pass
 
@@ -46,12 +47,13 @@ def sender_name(db, sid: int) -> str:
     return nick or f"用户{sid}"
 
 
-def make_callback(db, chat_name: str):
+def make_callback(db, chat_name=None):
     """为某个会话生成回调函数。callback(msg: dict, listener)"""
     def on_msg(msg: dict, lst: Listener):
         sender = sender_name(db, msg["sender_id"])
         t = fmt_time(msg["create_time"])
-        print(f"[{t}] {chat_name} | {sender} ({msg['type']}) {msg['content']}")
+        chat = chat_name or msg["username"]
+        print(f"[{t}] {chat} | {sender} ({msg['type']}) {msg['content']}")
         # 可在此扩展业务：msg['content'] 含关键字时自动回复等
     return on_msg
 
@@ -75,7 +77,7 @@ def main():
     names = [a for a in sys.argv[1:] if not a.startswith("-")]
     all_chats = "--all" in sys.argv
 
-    db = WeChatDB()
+    db = WeChatDB(db_dir=r"D:\\xwechat_files")
     info = db.get_self_info()
     print(f"账号：{info.get('nick_name') or info.get('username')}")
 
@@ -86,25 +88,27 @@ def main():
         #print(f"  {s['username']:<24} 未读={s['unread']}  {s['summary'][:24] or ''}")
 
     # 2. 确定监听目标
-    if all_chats:
-        names = [s["username"] for s in sessions]
-    elif not names:
+    if not all_chats and not names:
         names = ["送你挖银子"]
-    if not names:
+    if not all_chats and not names:
         print("未找到任何会话，退出")
         sys.exit(1)
 
     # 3. 昵称/备注 → username 映射
-    resolved = [resolve_name(db, sessions, n) for n in names]
+    resolved = [] if all_chats else [resolve_name(db, sessions, n) for n in names]
     for raw, got in zip(names, resolved):
         if raw != got:
             print(f"  「{raw}」→ {got}")
 
     # 4. 注册监听（回调在后台线程触发）
     lst = Listener(db, interval=1.0)
-    for name in resolved:
-        lst.add_listener(name, make_callback(db, name))
-        print(f"  监听：{name}")
+    if all_chats:
+        lst.add_all(make_callback(db), discover=True)
+        print("  监听：全部会话（自动发现新会话）")
+    else:
+        for name in resolved:
+            lst.add_listener(name, make_callback(db, name))
+            print(f"  监听：{name}")
 
     print("\n开始监听（Ctrl+C 停止）...")
     lst.start()

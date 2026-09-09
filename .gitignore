@@ -13,6 +13,7 @@ dist/
 wxauto_logs/
 @AutomationLog.txt
 *.log
+deploy/.env
 
 # Virtual environments
 .venv/

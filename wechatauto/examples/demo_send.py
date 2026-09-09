@@ -122,7 +122,7 @@ def main():
     args = parser.parse_args()
 
     #who = args.target
-    who = "卢立竺"
+    who = "懒猪儿"
     text = args.content or f"wechatauto 发送测试 {time.strftime('%H:%M:%S')}"
     image = pick_default_image() if (args.image is True or (args.image is None and not args.skip_image)) else args.image
     file_ = DEFAULT_FILE if (args.file is True or (args.file is None and not args.skip_file)) else args.file

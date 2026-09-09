@@ -42,6 +42,8 @@ dependencies = [
 [project.optional-dependencies]
 moments = ["pyautogui>=0.9.53", "opencv-python>=4.8.0"]
 guia = ["winsdk>=1.0.0b10", "pypinyin>=0.48.0"]
+storage = ["psycopg[binary]>=3.2,<4", "minio>=7.2,<8"]
+ai = ["silk-python>=0.2.8,<1"]
 
 [project.urls]
 Homepage = "https://github.com/fanyuantaier/wechatauto-replica"
