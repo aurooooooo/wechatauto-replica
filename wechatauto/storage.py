@@ -92,6 +92,8 @@ SCHEMA_STATEMENTS = (
         origin_session_id TEXT NOT NULL,
         origin_session_name TEXT NOT NULL,
         session_type TEXT NOT NULL CHECK (session_type IN ('private', 'group')),
+        reminder_target_id TEXT,
+        reminder_target_name TEXT,
         title TEXT NOT NULL,
         event_at TIMESTAMPTZ NOT NULL,
         event_all_day BOOLEAN NOT NULL DEFAULT FALSE,
@@ -102,7 +104,8 @@ SCHEMA_STATEMENTS = (
             ('pending', 'sending', 'sent', 'failed')),
         reminder_error TEXT,
         reminded_at TIMESTAMPTZ,
-        source_message_id BIGINT NOT NULL UNIQUE REFERENCES wechat_messages(id),
+        source_message_id BIGINT NOT NULL REFERENCES wechat_messages(id),
+        source_item_index INTEGER NOT NULL DEFAULT 0,
         metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -118,6 +121,25 @@ SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_wechat_todos_reminder_pending
     ON wechat_todos (account_id, remind_at)
     WHERE status = 'active' AND reminder_status = 'pending'
+    """,
+    "ALTER TABLE wechat_todos ADD COLUMN IF NOT EXISTS source_item_index INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE wechat_todos ADD COLUMN IF NOT EXISTS reminder_target_id TEXT",
+    "ALTER TABLE wechat_todos ADD COLUMN IF NOT EXISTS reminder_target_name TEXT",
+    """
+    UPDATE wechat_todos SET reminder_target_id=creator_id,
+        reminder_target_name=creator_name
+    WHERE reminder_target_id IS NULL OR reminder_target_name IS NULL
+    """,
+    "ALTER TABLE wechat_todos DROP CONSTRAINT IF EXISTS wechat_todos_source_message_id_key",
+    """
+    UPDATE wechat_todos SET remind_at=event_at, reminder_status='pending',
+        updated_at=NOW()
+    WHERE status='active' AND event_all_day=FALSE AND remind_at IS NULL
+      AND event_at >= NOW()
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wechat_todos_source_item
+    ON wechat_todos (source_message_id, source_item_index)
     """,
     """
     CREATE TABLE IF NOT EXISTS wechat_todo_delete_requests (
@@ -135,6 +157,44 @@ SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_wechat_todo_delete_pending
     ON wechat_todo_delete_requests (account_id, creator_id, session_id, created_at DESC)
+    WHERE status = 'pending'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS wechat_todo_replace_requests (
+        id BIGSERIAL PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        creator_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        source_message_id BIGINT NOT NULL REFERENCES wechat_messages(id),
+        replacements JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'confirmed', 'cancelled', 'expired')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_wechat_todo_replace_pending
+    ON wechat_todo_replace_requests (account_id, creator_id, session_id, created_at DESC)
+    WHERE status = 'pending'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS wechat_todo_clarifications (
+        id BIGSERIAL PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        creator_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        context TEXT NOT NULL,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'confirmed', 'cancelled', 'expired')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_wechat_todo_clarification_pending
+    ON wechat_todo_clarifications (account_id, creator_id, session_id, created_at DESC)
     WHERE status = 'pending'
     """,
     """
@@ -488,38 +548,293 @@ class ArchiveStorage:
                 (error[:2000], message_id),
             )
 
-    def create_todo(
-        self,
-        message: dict,
-        title: str,
-        event_at,
-        event_all_day: bool,
-        remind_at,
-    ) -> dict:
+    @staticmethod
+    def _normalized_title(title: str) -> str:
+        return re.sub(r"[\W_]+", "", title.casefold(), flags=re.UNICODE)
+
+    @staticmethod
+    def _replacement_json(item: dict, index: int, old_todos: List[dict]) -> dict:
+        return {
+            "old_todo_ids": [todo["id"] for todo in old_todos],
+            "item_index": index,
+            "title": item["title"],
+            "event_at": item["event_at"].isoformat(),
+            "event_all_day": bool(item.get("event_all_day")),
+            "remind_at": item["remind_at"].isoformat() if item.get("remind_at") else None,
+            "reminder_target_id": item.get("reminder_target_id"),
+            "reminder_target_name": item.get("reminder_target_name"),
+        }
+
+    @staticmethod
+    def _insert_todo(cur, message: dict, item: dict, index: int) -> dict:
+        target_id = item.get("reminder_target_id") or message["sender_id"]
+        target_name = item.get("reminder_target_name") or message["sender_name"]
+        cur.execute(
+            """
+            INSERT INTO wechat_todos (
+                account_id, creator_id, creator_name, origin_session_id,
+                origin_session_name, session_type, title, event_at,
+                reminder_target_id, reminder_target_name, event_all_day,
+                remind_at, reminder_status,
+                source_message_id, source_item_index
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s)
+            ON CONFLICT (source_message_id, source_item_index) DO UPDATE SET
+                title=EXCLUDED.title, event_at=EXCLUDED.event_at,
+                event_all_day=EXCLUDED.event_all_day,
+                remind_at=EXCLUDED.remind_at,
+                reminder_target_id=EXCLUDED.reminder_target_id,
+                reminder_target_name=EXCLUDED.reminder_target_name,
+                reminder_status=EXCLUDED.reminder_status,
+                updated_at=NOW()
+            RETURNING *
+            """,
+            (
+                message["account_id"], message["sender_id"],
+                message["sender_name"], message["session_id"],
+                message["session_name"], message["session_type"],
+                item["title"], item["event_at"],
+                target_id, target_name,
+                item["event_all_day"], item.get("remind_at"),
+                "pending" if item.get("remind_at") is not None else None,
+                message["id"], index,
+            ),
+        )
+        return cur.fetchone()
+
+    def create_todos(self, message: dict, items: List[dict]) -> dict:
+        """批量创建；同时间同标题更新，不同标题等待用户确认替换。"""
+        created, updated, conflicts, replacements = [], [], [], []
         with self._connect() as conn:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
                     """
-                    INSERT INTO wechat_todos (
-                        account_id, creator_id, creator_name, origin_session_id,
-                        origin_session_name, session_type, title, event_at,
-                        event_all_day, remind_at, reminder_status,
-                        source_message_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s IS NULL THEN NULL ELSE 'pending' END, %s)
-                    ON CONFLICT (source_message_id) DO UPDATE SET
-                        source_message_id=EXCLUDED.source_message_id
-                    RETURNING *
+                    UPDATE wechat_todo_replace_requests SET status='cancelled'
+                    WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                      AND status='pending'
                     """,
-                    (
-                        message["account_id"], message["sender_id"],
-                        message["sender_name"], message["session_id"],
-                        message["session_name"], message["session_type"],
-                        title, event_at, event_all_day, remind_at, remind_at,
-                        message["id"],
-                    ),
+                    (message["account_id"], message["sender_id"], message["session_id"]),
+                )
+                for index, item in enumerate(items):
+                    cur.execute(
+                        """
+                        SELECT * FROM wechat_todos
+                        WHERE account_id=%s AND creator_id=%s AND event_at=%s
+                          AND status='active'
+                        ORDER BY id
+                        FOR UPDATE
+                        """,
+                        (message["account_id"], message["sender_id"], item["event_at"]),
+                    )
+                    existing = list(cur.fetchall())
+                    same = [todo for todo in existing if self._normalized_title(todo["title"])
+                            == self._normalized_title(item["title"])]
+                    if len(existing) == 1 and same:
+                        cur.execute(
+                            """
+                            UPDATE wechat_todos SET title=%s, event_all_day=%s,
+                                remind_at=%s,
+                                reminder_status=%s,
+                                reminder_error=NULL, reminded_at=NULL,
+                                origin_session_id=%s, origin_session_name=%s,
+                                session_type=%s, creator_name=%s,
+                                reminder_target_id=%s, reminder_target_name=%s,
+                                source_message_id=%s, source_item_index=%s,
+                                updated_at=NOW()
+                            WHERE id=%s RETURNING *
+                            """,
+                            (
+                                item["title"], item["event_all_day"], item.get("remind_at"),
+                                "pending" if item.get("remind_at") is not None else None,
+                                message["session_id"],
+                                message["session_name"], message["session_type"],
+                                message["sender_name"],
+                                item.get("reminder_target_id") or message["sender_id"],
+                                item.get("reminder_target_name") or message["sender_name"],
+                                message["id"], index,
+                                same[0]["id"],
+                            ),
+                        )
+                        updated.append(cur.fetchone())
+                    elif existing:
+                        conflicts.append({"existing": existing, "new": item})
+                        replacements.append(self._replacement_json(item, index, existing))
+                    else:
+                        created.append(self._insert_todo(cur, message, item, index))
+                if replacements:
+                    cur.execute(
+                        """
+                        INSERT INTO wechat_todo_replace_requests (
+                            account_id, creator_id, session_id, source_message_id,
+                            replacements, expires_at
+                        ) VALUES (%s, %s, %s, %s, %s::jsonb,
+                            NOW() + INTERVAL '15 minutes')
+                        """,
+                        (
+                            message["account_id"], message["sender_id"],
+                            message["session_id"], message["id"],
+                            json.dumps(replacements, ensure_ascii=False),
+                        ),
+                    )
+        return {"created": created, "updated": updated, "conflicts": conflicts}
+
+    def has_pending_todo_replace(
+        self, account_id: str, creator_id: str, session_id: str,
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM wechat_todo_replace_requests
+                WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                  AND status='pending' AND expires_at > NOW()
+                LIMIT 1
+                """,
+                (account_id, creator_id, session_id),
+            ).fetchone()
+            return row is not None
+
+    def confirm_todo_replace(
+        self, account_id: str, creator_id: str, session_id: str,
+    ) -> dict:
+        with self._connect() as conn:
+            with conn.cursor(row_factory=self._dict_row) as cur:
+                cur.execute(
+                    """UPDATE wechat_todo_replace_requests SET status='expired'
+                       WHERE status='pending' AND expires_at <= NOW()"""
+                )
+                cur.execute(
+                    """
+                    SELECT request.*, message.sender_name, message.session_name,
+                           message.session_type
+                    FROM wechat_todo_replace_requests AS request
+                    JOIN wechat_messages AS message ON message.id=request.source_message_id
+                    WHERE request.account_id=%s AND request.creator_id=%s
+                      AND request.session_id=%s AND request.status='pending'
+                      AND request.expires_at > NOW()
+                    ORDER BY request.created_at DESC LIMIT 1 FOR UPDATE
+                    """,
+                    (account_id, creator_id, session_id),
+                )
+                request = cur.fetchone()
+                if not request:
+                    return {"status": "missing", "todos": []}
+                message = {
+                    "id": request["source_message_id"], "account_id": account_id,
+                    "sender_id": creator_id, "sender_name": request["sender_name"],
+                    "session_id": session_id, "session_name": request["session_name"],
+                    "session_type": request["session_type"],
+                }
+                todos = []
+                for replacement in request["replacements"]:
+                    cur.execute(
+                        """
+                        UPDATE wechat_todos SET status='deleted', deleted_at=NOW(),
+                            reminder_status=NULL, updated_at=NOW()
+                        WHERE id=ANY(%s) AND account_id=%s AND creator_id=%s
+                          AND status='active'
+                        """,
+                        (replacement["old_todo_ids"], account_id, creator_id),
+                    )
+                    item = {
+                        "title": replacement["title"],
+                        "event_at": replacement["event_at"],
+                        "event_all_day": replacement["event_all_day"],
+                        "remind_at": replacement.get("remind_at"),
+                        "reminder_target_id": replacement.get("reminder_target_id"),
+                        "reminder_target_name": replacement.get("reminder_target_name"),
+                    }
+                    todos.append(self._insert_todo(
+                        cur, message, item, replacement["item_index"],
+                    ))
+                cur.execute(
+                    "UPDATE wechat_todo_replace_requests SET status='confirmed' WHERE id=%s",
+                    (request["id"],),
+                )
+                return {"status": "replaced", "todos": todos}
+
+    def cancel_todo_replace(
+        self, account_id: str, creator_id: str, session_id: str,
+    ) -> bool:
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE wechat_todo_replace_requests SET status='cancelled'
+                WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                  AND status='pending'
+                """,
+                (account_id, creator_id, session_id),
+            )
+            return result.rowcount > 0
+
+    def save_todo_clarification(
+        self, message: dict, context: str, question: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE wechat_todo_clarifications SET status='cancelled'
+                WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                  AND status='pending'
+                """,
+                (message["account_id"], message["sender_id"], message["session_id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO wechat_todo_clarifications (
+                    account_id, creator_id, session_id, context, question, expires_at
+                ) VALUES (%s, %s, %s, %s, %s, NOW() + INTERVAL '15 minutes')
+                """,
+                (
+                    message["account_id"], message["sender_id"],
+                    message["session_id"], context, question,
+                ),
+            )
+
+    def get_pending_todo_clarification(
+        self, account_id: str, creator_id: str, session_id: str,
+    ) -> Optional[dict]:
+        with self._connect() as conn:
+            with conn.cursor(row_factory=self._dict_row) as cur:
+                cur.execute(
+                    """
+                    UPDATE wechat_todo_clarifications SET status='expired'
+                    WHERE status='pending' AND expires_at <= NOW()
+                    """
+                )
+                cur.execute(
+                    """
+                    SELECT * FROM wechat_todo_clarifications
+                    WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                      AND status='pending' AND expires_at > NOW()
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (account_id, creator_id, session_id),
                 )
                 return cur.fetchone()
+
+    def clear_todo_clarification(self, clarification_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE wechat_todo_clarifications SET status='confirmed'
+                WHERE id=%s AND status='pending'
+                """,
+                (clarification_id,),
+            )
+
+    def cancel_todo_clarification(
+        self, account_id: str, creator_id: str, session_id: str,
+    ) -> bool:
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE wechat_todo_clarifications SET status='cancelled'
+                WHERE account_id=%s AND creator_id=%s AND session_id=%s
+                  AND status='pending'
+                """,
+                (account_id, creator_id, session_id),
+            )
+            return result.rowcount > 0
 
     @staticmethod
     def _todo_where(start_at, end_at, keyword):

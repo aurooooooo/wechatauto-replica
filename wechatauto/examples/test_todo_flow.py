@@ -3,31 +3,78 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from wechatauto.ai_worker import AIWorker, SHANGHAI, _parse_datetime
+from wechatauto.ai_worker import (
+    AIWorker, SHANGHAI, _format_reminder, _parse_datetime,
+)
+from wechatauto.send_text import resolve_group_member
+from wechatauto.time_resolver import TimeResolver
 
 
 class _Storage:
     def __init__(self):
         self.owner = None
+        self.created_items = None
+        self.create_result = None
+        self.clarification = None
 
-    def create_todo(self, message, title, event_at, event_all_day, remind_at):
+    def create_todos(self, message, items):
         self.owner = message["sender_id"]
+        self.created_items = items
+        if self.create_result is not None:
+            return self.create_result
         return {
-            "id": 12, "title": title, "event_at": event_at,
-            "event_all_day": event_all_day, "remind_at": remind_at,
+            "created": [{
+                "id": 12 + index, "title": item["title"],
+                "event_at": item["event_at"],
+                "event_all_day": item["event_all_day"],
+                "remind_at": item["remind_at"],
+                "session_type": message["session_type"],
+                "origin_session_name": message["session_name"],
+                "reminder_target_id": item["reminder_target_id"],
+                "reminder_target_name": item["reminder_target_name"],
+            } for index, item in enumerate(items)],
+            "updated": [], "conflicts": [],
         }
 
     def list_todos(self, account_id, creator_id, *args):
         self.owner = creator_id
         return []
 
+    def confirm_todo_replace(self, account_id, creator_id, session_id):
+        return {"status": "replaced", "todos": [{
+            "id": 14, "title": "打游戏",
+            "event_at": _parse_datetime("2026-09-09T22:00:00+08:00"),
+            "event_all_day": False,
+            "remind_at": _parse_datetime("2026-09-09T21:55:00+08:00"),
+        }]}
+
+    def cancel_todo_replace(self, account_id, creator_id, session_id):
+        return True
+
+    def save_todo_clarification(self, message, context, question):
+        self.clarification = {"context": context, "question": question}
+
+
+class _WeChatDB:
+    def get_group_members(self, group_id):
+        assert group_id == "room@chatroom"
+        return [
+            {"username": "user_wxid", "nick_name": "张三", "remark": ""},
+            {"username": "worker_wxid", "nick_name": "恸。", "remark": "李工"},
+        ]
 
 class TodoFlowTest(unittest.TestCase):
     def setUp(self):
         self.worker = AIWorker.__new__(AIWorker)
         self.worker.account_id = "self_wxid"
         self.worker.storage = _Storage()
+        self.worker.db_dir = r"D:\xwechat_files"
+        self.worker.log = lambda *args: None
+        self.worker.wechat_db = _WeChatDB()
+        self.worker.time_resolver = TimeResolver()
+        self.now = _parse_datetime("2026-09-10T14:00:00+08:00")
         self.row = {
             "id": 1, "account_id": "self_wxid", "sender_id": "user_wxid",
             "sender_name": "张三", "session_id": "room@chatroom",
@@ -36,14 +83,175 @@ class TodoFlowTest(unittest.TestCase):
 
     def test_create_returns_structured_overview_for_creator(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "title": "和客户甲开会",
-            "event_at": "2026-09-11T19:30:00+08:00",
-            "event_all_day": False,
-            "remind_at": "2026-09-11T19:10:00+08:00",
-        }, "")
+            "intent": "create", "items": [{
+                "title": "和客户甲开会",
+                "date_text": "明天", "time_text": "晚上七点半",
+                "remind_text": "提前20分钟",
+            }],
+        }, "", self.now)
         self.assertEqual(self.worker.storage.owner, "user_wxid")
-        self.assertIn("#12", reply)
-        self.assertIn("2026-09-11 19:10", reply)
+        self.assertEqual(reply, """✅ 待办创建成功
+
+📌 事项：和客户甲开会
+
+👤 提醒对象：张三
+
+📍 提醒群聊：项目群
+
+⏰ 执行时间：
+2026-09-11 19:30
+
+🔔 提醒时间：
+2026-09-11 19:10
+
+编号：#12""")
+
+    def test_plain_name_cannot_create_todo_for_another_member(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "去工地铺线", "date_text": "后天",
+                "time_text": "上午九点", "remind_text": "到时候",
+                "target_text": "李工",
+            }],
+        }, "", self.now)
+        self.assertIn("必须在当前消息中真实 @该成员", reply)
+        self.assertIsNone(self.worker.storage.owner)
+
+    def test_unknown_group_member_is_rejected_before_database_write(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "去工地铺线", "date_text": "后天",
+                "time_text": "上午九点", "remind_text": "到时候",
+                "target_text": "不存在的人",
+            }],
+        }, "", self.now)
+        self.assertIn("必须在当前消息中真实 @该成员", reply)
+        self.assertIsNone(self.worker.storage.owner)
+
+    def test_self_pronoun_always_targets_creator(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "下班", "date_text": "今天",
+                "time_text": "下午五点四十五", "remind_text": "到时候",
+                "target_text": "我",
+            }],
+        }, "", self.now)
+        self.assertIn("👤 提醒对象：张三", reply)
+        self.assertEqual(
+            self.worker.storage.created_items[0]["reminder_target_id"], "user_wxid",
+        )
+
+    def test_plain_member_name_ignores_trailing_punctuation(self):
+        name, member_id = resolve_group_member(
+            self.worker.wechat_db, "room@chatroom", member="恸",
+        )
+        self.assertEqual((name, member_id), ("恸。", "worker_wxid"))
+
+    def test_real_mention_wxid_has_priority_over_model_name(self):
+        self.row["metadata"] = {
+            "mentioned_user_ids": ["self_wxid", "worker_wxid"],
+        }
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "下班", "date_text": "今天",
+                "time_text": "下午五点四十五", "remind_text": "到时候",
+                "target_text": "恸",
+            }],
+        }, "", self.now)
+        self.assertIn("👤 提醒对象：恸。", reply)
+        self.assertEqual(
+            self.worker.storage.created_items[0]["reminder_target_id"], "worker_wxid",
+        )
+
+    def test_due_reminder_uses_stored_member_wxid(self):
+        todo = {
+            "id": 12, "title": "去工地铺线", "session_type": "group",
+            "origin_session_id": "room@chatroom", "origin_session_name": "项目群",
+            "creator_name": "张三", "reminder_target_name": "李工",
+            "reminder_target_id": "worker_wxid",
+            "event_at": _parse_datetime("2026-09-12T09:00:00+08:00"),
+            "event_all_day": False,
+        }
+        self.worker.storage.claim_due_reminder = lambda account_id: todo
+        self.worker.storage.mark_reminder_sent = lambda todo_id: None
+        self.worker.storage.mark_reminder_failure = lambda todo_id, error: None
+        with patch("wechatauto.ai_worker.send_text") as mocked:
+            self.assertTrue(self.worker._remind_one())
+        self.assertEqual(mocked.call_args.kwargs["at_user_id"], "worker_wxid")
+        self.assertEqual(mocked.call_args.kwargs["at"], "李工")
+
+    def test_stored_wxid_resolves_current_member_name_after_rename(self):
+        current_name, member_id = resolve_group_member(
+            self.worker.wechat_db, "room@chatroom", member="旧名称",
+            member_id="worker_wxid",
+        )
+        self.assertEqual((current_name, member_id), ("李工", "worker_wxid"))
+
+    def test_create_multiple_todos(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [
+                {"title": "看剧", "date_text": "今天", "time_text": "晚上八点",
+                 "remind_text": "提前10分钟"},
+                {"title": "打游戏", "date_text": "今天", "time_text": "晚上十点",
+                 "remind_text": "提前5分钟"},
+            ],
+        }, "", self.now)
+        self.assertIn("待办创建成功（2项）", reply)
+        self.assertIn("📌 事项：看剧", reply)
+        self.assertIn("📌 事项：打游戏", reply)
+
+    def test_create_defaults_reminder_to_event_time(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "出发去看办公室",
+                "date_text": "今天", "time_text": "下午两点半",
+                "remind_text": None,
+            }],
+        }, "", self.now)
+        self.assertIn("提醒时间：\n2026-09-10 14:30", reply)
+
+    def test_ambiguous_time_enters_explicit_confirmation(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "吃饭", "date_text": "今天",
+                "time_text": "十一点半", "remind_text": None,
+            }],
+        }, "", self.now)
+        self.assertIn("待办时间需要确认", reply)
+        self.assertIn("真实 @robot", reply)
+        self.assertIsNotNone(self.worker.storage.clarification)
+
+    def test_chat_cannot_claim_todo_was_created(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "chat", "reply": "好的，已记录您今天下午15:30的答辩提醒。",
+        }, "")
+        self.assertIn("待办创建失败", reply)
+
+    def test_conflict_asks_for_real_group_mention(self):
+        event_at = _parse_datetime("2026-09-10T22:00:00+08:00")
+        self.worker.storage.create_result = {
+            "created": [], "updated": [],
+            "conflicts": [{
+                "existing": [{"id": 3, "title": "开会"}],
+                "new": {"title": "打游戏", "event_at": event_at,
+                        "event_all_day": False},
+            }],
+        }
+        reply = self.worker._handle_command(self.row, {
+            "intent": "create", "items": [{
+                "title": "打游戏", "date_text": "今天",
+                "time_text": "晚上十点", "remind_text": None,
+            }],
+        }, "", self.now)
+        self.assertIn("同一时间已有其他待办", reply)
+        self.assertIn("真实 @robot", reply)
+
+    def test_confirm_replace(self):
+        reply = self.worker._handle_command(
+            self.row, {"intent": "confirm_replace"}, "",
+        )
+        self.assertIn("待办替换成功", reply)
+        self.assertIn("📌 事项：打游戏", reply)
 
     def test_list_is_scoped_to_sender(self):
         reply = self.worker._handle_command(self.row, {
@@ -56,6 +264,26 @@ class TodoFlowTest(unittest.TestCase):
     def test_naive_model_time_is_beijing_time(self):
         parsed = _parse_datetime("2026-09-11T19:30:00")
         self.assertEqual(parsed.tzinfo, SHANGHAI)
+
+    def test_reminder_uses_relative_today_template(self):
+        now = _parse_datetime("2026-09-09T17:00:00+08:00")
+        todo = {
+            "id": 3, "title": "开会", "creator_name": "张三",
+            "event_at": _parse_datetime("2026-09-09T17:05:00+08:00"),
+            "event_all_day": False,
+        }
+        self.assertEqual(_format_reminder(todo, now), """⏰ 待办提醒
+
+📌 开会
+
+👤 发起人：张三
+
+执行时间：
+今天 17:05
+
+请及时处理。
+
+编号：#3""")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from typing import Dict, Iterable, Tuple
 
 from wechatauto.ai_worker import AIWorker
 from wechatauto.db import Listener, WeChatDB
-from wechatauto.qwen_client import reply_trigger
+from wechatauto.qwen_client import mentioned_user_ids, reply_trigger
 from wechatauto.storage import ArchiveStorage, MediaArchiveWorker
 
 try:
@@ -224,22 +224,25 @@ def make_storage_callback(
                         context["session_id"], message["local_id"],
                     )
                 incoming = message.get("sender_id") != 2
-                should_reply = (
+                trigger_content = quote["trigger_content"] if quote else context["content"]
+                explicit_trigger = (
                     message_type == "text" and incoming
                     and reply_trigger(
-                        context["session_type"],
-                        quote["trigger_content"] if quote else context["content"],
-                        message.get("source") or "",
-                        account_id,
+                        context["session_type"], trigger_content,
+                        message.get("source") or "", account_id,
                     )
                 )
+                should_reply = explicit_trigger
                 metadata = {
                     "wechat_type": message.get("type"),
                     "type_code": raw.get("local_type") if raw
                     else message.get("type_code") or TYPE_CODES.get(message.get("type")),
                 }
                 if context["session_type"] == "group":
-                    metadata["real_mention"] = should_reply
+                    metadata["mentioned_user_ids"] = mentioned_user_ids(
+                        message.get("source") or "",
+                    )
+                    metadata["real_mention"] = explicit_trigger
                 if quote:
                     metadata["quote"] = quote["metadata"]
                 storage.save_message({

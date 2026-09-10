@@ -7,7 +7,7 @@ import unittest
 
 from wechatauto.db import Listener
 from wechatauto.listen_messages import make_storage_callback, parse_quote_message
-from wechatauto.qwen_client import reply_prompt, reply_trigger
+from wechatauto.qwen_client import mentioned_user_ids, reply_prompt, reply_trigger
 
 
 class _Names:
@@ -37,7 +37,6 @@ class _Storage:
 
     def advance_offset(self, account_id, session_id, sort_seq):
         self.offsets.append((account_id, session_id, sort_seq))
-
 
 class _CallbackListener:
     def __init__(self):
@@ -139,6 +138,29 @@ class ArchiveFlowTest(unittest.TestCase):
             "self_wxid",
         ))
         self.assertEqual(reply_prompt("group", "@robot  请回答"), "请回答")
+        self.assertEqual(
+            mentioned_user_ids(
+                "<msgsource><atuserlist>self_wxid,wxid_other</atuserlist></msgsource>"
+            ),
+            ["self_wxid", "wxid_other"],
+        )
+
+    def test_real_mention_ids_are_persisted(self):
+        storage = _Storage()
+        callback = make_storage_callback(_Names(), storage, "self_wxid")
+        callback({
+            "username": "room@chatroom", "local_id": 8, "sort_seq": 28,
+            "sender_id": 3, "create_time": 8, "type": "文本",
+            "content": "wxid_a: @robot @李工 明天提醒",
+            "source": (
+                "<msgsource><atuserlist>self_wxid,wxid_worker"
+                "</atuserlist></msgsource>"
+            ),
+        }, _CallbackListener())
+        self.assertEqual(
+            storage.messages[0]["metadata"]["mentioned_user_ids"],
+            ["self_wxid", "wxid_worker"],
+        )
 
     def test_quote_appmsg_is_stored_as_text_but_other_cards_are_skipped(self):
         storage = _Storage()

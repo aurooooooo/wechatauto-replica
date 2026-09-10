@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from typing import Optional, Tuple
 
 from wechatauto import WeChatDB
@@ -66,6 +67,55 @@ def resolve_target(db: WeChatDB, target: str) -> Tuple[str, str]:
     hit = candidates[0]
     display_name = hit.get("remark") or hit.get("nick_name") or hit["username"]
     return display_name, hit["username"]
+
+
+def resolve_group_member(
+    db: WeChatDB,
+    group_id: str,
+    member: Optional[str] = None,
+    member_id: Optional[str] = None,
+) -> Tuple[str, str]:
+    """在指定群内唯一解析成员，返回当前可见名称和稳定 username/wxid。"""
+    def key(value: Optional[str]) -> str:
+        return "".join(
+            char.casefold() for char in str(value or "").strip().lstrip("@").strip()
+            if not char.isspace() and not unicodedata.category(char).startswith("P")
+        )
+
+    members = db.get_group_members(group_id)
+    if member_id:
+        exact_id = [item for item in members if item.get("username") == member_id]
+        if len(exact_id) != 1:
+            raise LookupError("提醒对象已不在当前群：%s" % member_id)
+        hit = exact_id[0]
+    else:
+        query = (member or "").strip()
+        if not query:
+            raise ValueError("@成员不能为空")
+        normalized = key(query)
+        exact = [
+            item for item in members
+            if normalized in {
+                key(item.get("username")), key(item.get("nick_name")),
+                key(item.get("remark")),
+            }
+        ]
+        if not exact:
+            raise LookupError("当前群内未找到成员：%s" % query)
+        if len(exact) != 1:
+            choices = "、".join(
+                "%s(%s)" % (
+                    item.get("remark") or item.get("nick_name") or item["username"],
+                    item["username"],
+                ) for item in exact[:5]
+            )
+            raise LookupError("当前群内成员名称不唯一：%s；候选：%s" % (query, choices))
+        hit = exact[0]
+    aliases = [hit.get("remark"), hit.get("nick_name"), hit.get("username")]
+    matched_alias = next(
+        (alias for alias in aliases if member and key(alias) == key(member)), None,
+    )
+    return matched_alias or next(alias for alias in aliases if alias), hit["username"]
 
 
 def open_chat_once(uia: WeChatUIA, display_name: str) -> None:
@@ -169,6 +219,7 @@ def send_text(
     text: str = DEFAULT_TEXT,
     db_dir: Optional[str] = DEFAULT_DB_DIR,
     at: Optional[str] = None,
+    at_user_id: Optional[str] = None,
 ) -> dict:
     """查询目标并发送文本；可直接供 function call 或 MCP 包装调用。"""
     if not isinstance(text, str) or not text:
@@ -182,15 +233,27 @@ def send_text(
         "RESOLVE",
         "目标已解析：%s -> %s (%s)" % (target, display_name, username),
     )
-    if at and not username.endswith("@chatroom"):
+    if (at or at_user_id) and not username.endswith("@chatroom"):
         raise ValueError("--at 只能用于群聊，当前目标不是群聊：%s" % display_name)
+
+    resolved_at = at
+    resolved_at_user_id = at_user_id
+    if at or at_user_id:
+        resolved_at, resolved_at_user_id = resolve_group_member(
+            db, username, member=at, member_id=at_user_id,
+        )
+        operation_log(
+            "AT_RESOLVE", "群成员已解析：%s -> %s (%s)" % (
+                at or at_user_id, resolved_at, resolved_at_user_id,
+            ),
+        )
 
     operation_log("WINDOW", "连接微信 UIA 窗口")
     uia = WeChatUIA()
     open_chat_once(uia, display_name)
 
-    if at:
-        send_text_with_mention(uia, at, text)
+    if resolved_at:
+        send_text_with_mention(uia, resolved_at, text)
     else:
         operation_log("SEND", "向当前输入框粘贴文本并按回车")
         if not uia.send_text(text):
@@ -204,7 +267,8 @@ def send_text(
         "resolved_name": display_name,
         "username": username,
         "content": text,
-        "at": at,
+        "at": resolved_at,
+        "at_user_id": resolved_at_user_id,
     }
 
 
