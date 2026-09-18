@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import base64
+from configparser import ConfigParser
+from functools import lru_cache
 import json
 import os
 import mimetypes
@@ -14,6 +16,28 @@ from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+PROMPT_FILE = Path(__file__).with_name("prompts.ini")
+
+
+@lru_cache(maxsize=1)
+def _prompt_config() -> ConfigParser:
+    config = ConfigParser(interpolation=None)
+    if not config.read(PROMPT_FILE, encoding="utf-8"):
+        raise RuntimeError("Prompt 文件不存在：%s" % PROMPT_FILE)
+    return config
+
+
+def render_prompt(name: str, **values) -> str:
+    try:
+        template = _prompt_config().get(name, "template").strip()
+    except Exception as exc:
+        raise RuntimeError("Prompt 配置缺少有效段落：%s" % name) from exc
+    try:
+        return template.format(**values)
+    except KeyError as exc:
+        raise RuntimeError("Prompt %s 缺少模板变量：%s" % (name, exc.args[0])) from exc
 
 class QwenClient:
     def __init__(
@@ -91,29 +115,7 @@ class QwenClient:
 
     def interpret(self, text: str, now_iso: str) -> dict:
         """将触发消息解析为聊天或待办命令。"""
-        instruction = """当前北京时间：%s
-请解析下面的用户消息，只返回一个 JSON 对象，不要 Markdown。
-intent 只能是 create、list、delete、confirm_delete、cancel_delete、confirm_replace、cancel_replace、chat。
-- create：识别创建一个或多个待办。只返回 items 数组，每个元素只包含 title、date_text、time_text、remind_text、target_text。
-  一条消息中的每件独立事项都必须各生成一个 items 元素，不得合并或遗漏。
-  title 只保留事项本身，不包含日期、时间、提前量或“提醒我”等说明。
-  date_text 原样保留日期表达，如“今天”“明天”“后天”“下周一”；没有则为 null。
-  time_text 原样保留时间表达，如“下午三点”“等会儿三点半”“半小时后”；没有则为 null。
-  remind_text 原样保留提醒表达，如“提前30分钟”“当天早上8点”“到时候”；没有则为 null。
-  target_text 只在用户明确要求提醒另一个人时填写其原始名称，如“提醒李工去铺线”返回“李工”；提醒用户自己或未指定对象时为 null。
-  title 不得包含 target_text，例如“提醒李工去工地铺线”的 title 是“去工地铺线”。
-  “我”“我自己”“自己”“本人”都表示用户本人，不得作为 target_text。
-  不要计算、补全、改写或猜测任何日期时间，不得返回 event_at、remind_at。
-- list：查询待办。返回 range_start、range_end、keyword；range_end 是不包含的结束时间。
-- delete：请求删除。返回 range_start、range_end、keyword；此步只查候选，不直接删除。
-- confirm_delete：用户确认删除或选择待办编号。返回 todo_id，未指定编号则为 null。
-- cancel_delete：取消删除。
-- confirm_replace：用户确认用新待办替换同一时间的旧待办。
-- cancel_replace：用户拒绝或取消替换。
-- chat：其他消息，直接在 reply 中给出自然回复。
-  chat 不得声称已创建、已记录或已设置待办/提醒；只有 create 才能表示创建请求。
-未使用的字段设为 null。相对日期以当前北京时间为基准，模糊日期取最近的未来日期。
-用户消息：%s""" % (now_iso, text)
+        instruction = render_prompt("todo_interpret", now_iso=now_iso, text=text)
         response = self._json_request(
             self.compatible_base_url + "/chat/completions",
             method="POST",
@@ -144,6 +146,7 @@ intent 只能是 create、list、delete、confirm_delete、cancel_delete、confi
             if not isinstance(items, list):
                 items = [{key: result.get(key) for key in (
                     "title", "date_text", "time_text", "remind_text", "target_text",
+                    "date_semantic", "time_semantic", "reminder_semantic",
                 )}]
             result["items"] = items
         return result

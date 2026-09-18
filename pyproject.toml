@@ -55,5 +55,5 @@ Issues = "https://github.com/fanyuantaier/wechatauto-replica/issues"  # 上游 w
 include = ["wechatauto*"]
 
 [tool.setuptools.package-data]
-wechatauto = ["py.typed"]
+wechatauto = ["py.typed", "prompts.ini"]
 "wechatauto.assets" = ["*.png"]

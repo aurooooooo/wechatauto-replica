@@ -12,12 +12,30 @@ from wechatauto.send_text import resolve_group_member
 from wechatauto.time_resolver import TimeResolver
 
 
+def _clock(hour, minute=0, period=None):
+    return {
+        "kind": "clock", "hour": hour, "minute": minute,
+        "day_period": period, "is_24_hour": False,
+    }
+
+
+def _todo(title, date_semantic, time_semantic, reminder_semantic=None, target=None):
+    return {
+        "title": title,
+        "date_semantic": date_semantic,
+        "time_semantic": time_semantic,
+        "reminder_semantic": reminder_semantic or {"kind": "at_event"},
+        "target_text": target,
+    }
+
+
 class _Storage:
     def __init__(self):
         self.owner = None
         self.created_items = None
         self.create_result = None
         self.clarification = None
+        self.delete_args = None
 
     def create_todos(self, message, items):
         self.owner = message["sender_id"]
@@ -41,6 +59,18 @@ class _Storage:
     def list_todos(self, account_id, creator_id, *args):
         self.owner = creator_id
         return []
+
+    def prepare_todo_delete(self, account_id, creator_id, session_id, *args):
+        self.delete_args = args
+        todo_id = args[-1]
+        if todo_id != 12:
+            return []
+        return [{
+            "id": 12, "title": "和客户甲开会",
+            "event_at": _parse_datetime("2026-09-11T19:30:00+08:00"),
+            "event_all_day": False,
+            "remind_at": _parse_datetime("2026-09-11T19:10:00+08:00"),
+        }]
 
     def confirm_todo_replace(self, account_id, creator_id, session_id):
         return {"status": "replaced", "todos": [{
@@ -83,60 +113,48 @@ class TodoFlowTest(unittest.TestCase):
 
     def test_create_returns_structured_overview_for_creator(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "和客户甲开会",
-                "date_text": "明天", "time_text": "晚上七点半",
-                "remind_text": "提前20分钟",
-            }],
+            "intent": "create", "items": [_todo(
+                "和客户甲开会", {"kind": "relative_days", "value": 1},
+                _clock(7, 30, "evening"),
+                {"kind": "before_event", "value": 20, "unit": "minutes"},
+            )],
         }, "", self.now)
         self.assertEqual(self.worker.storage.owner, "user_wxid")
         self.assertEqual(reply, """✅ 待办创建成功
-
-📌 事项：和客户甲开会
-
-👤 提醒对象：张三
-
-📍 提醒群聊：项目群
-
-⏰ 执行时间：
-2026-09-11 19:30
-
-🔔 提醒时间：
-2026-09-11 19:10
-
-编号：#12""")
+【待办】和客户甲开会
+【时间】2026-09-11 19:30
+【对象】张三
+【提醒】2026-09-11 19:10
+【编号】#12""")
 
     def test_plain_name_cannot_create_todo_for_another_member(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "去工地铺线", "date_text": "后天",
-                "time_text": "上午九点", "remind_text": "到时候",
-                "target_text": "李工",
-            }],
+            "intent": "create", "items": [_todo(
+                "去工地铺线", {"kind": "relative_days", "value": 2},
+                _clock(9, period="morning"), target="李工",
+            )],
         }, "", self.now)
         self.assertIn("必须在当前消息中真实 @该成员", reply)
         self.assertIsNone(self.worker.storage.owner)
 
     def test_unknown_group_member_is_rejected_before_database_write(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "去工地铺线", "date_text": "后天",
-                "time_text": "上午九点", "remind_text": "到时候",
-                "target_text": "不存在的人",
-            }],
+            "intent": "create", "items": [_todo(
+                "去工地铺线", {"kind": "relative_days", "value": 2},
+                _clock(9, period="morning"), target="不存在的人",
+            )],
         }, "", self.now)
         self.assertIn("必须在当前消息中真实 @该成员", reply)
         self.assertIsNone(self.worker.storage.owner)
 
     def test_self_pronoun_always_targets_creator(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "下班", "date_text": "今天",
-                "time_text": "下午五点四十五", "remind_text": "到时候",
-                "target_text": "我",
-            }],
+            "intent": "create", "items": [_todo(
+                "下班", {"kind": "today"}, _clock(5, 45, "afternoon"),
+                target="我",
+            )],
         }, "", self.now)
-        self.assertIn("👤 提醒对象：张三", reply)
+        self.assertIn("【对象】张三", reply)
         self.assertEqual(
             self.worker.storage.created_items[0]["reminder_target_id"], "user_wxid",
         )
@@ -152,13 +170,12 @@ class TodoFlowTest(unittest.TestCase):
             "mentioned_user_ids": ["self_wxid", "worker_wxid"],
         }
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "下班", "date_text": "今天",
-                "time_text": "下午五点四十五", "remind_text": "到时候",
-                "target_text": "恸",
-            }],
+            "intent": "create", "items": [_todo(
+                "下班", {"kind": "today"}, _clock(5, 45, "afternoon"),
+                target="恸",
+            )],
         }, "", self.now)
-        self.assertIn("👤 提醒对象：恸。", reply)
+        self.assertIn("【对象】恸。", reply)
         self.assertEqual(
             self.worker.storage.created_items[0]["reminder_target_id"], "worker_wxid",
         )
@@ -190,36 +207,38 @@ class TodoFlowTest(unittest.TestCase):
     def test_create_multiple_todos(self):
         reply = self.worker._handle_command(self.row, {
             "intent": "create", "items": [
-                {"title": "看剧", "date_text": "今天", "time_text": "晚上八点",
-                 "remind_text": "提前10分钟"},
-                {"title": "打游戏", "date_text": "今天", "time_text": "晚上十点",
-                 "remind_text": "提前5分钟"},
+                _todo(
+                    "看剧", {"kind": "today"}, _clock(8, period="evening"),
+                    {"kind": "before_event", "value": 10, "unit": "minutes"},
+                ),
+                _todo(
+                    "打游戏", {"kind": "today"}, _clock(10, period="evening"),
+                    {"kind": "before_event", "value": 5, "unit": "minutes"},
+                ),
             ],
         }, "", self.now)
         self.assertIn("待办创建成功（2项）", reply)
-        self.assertIn("📌 事项：看剧", reply)
-        self.assertIn("📌 事项：打游戏", reply)
+        self.assertIn("【待办】看剧", reply)
+        self.assertIn("【待办】打游戏", reply)
 
     def test_create_defaults_reminder_to_event_time(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "出发去看办公室",
-                "date_text": "今天", "time_text": "下午两点半",
-                "remind_text": None,
-            }],
+            "intent": "create", "items": [_todo(
+                "出发去看办公室", {"kind": "today"},
+                _clock(2, 30, "afternoon"),
+            )],
         }, "", self.now)
-        self.assertIn("提醒时间：\n2026-09-10 14:30", reply)
+        self.assertIn("【提醒】2026-09-10 14:30", reply)
 
-    def test_ambiguous_time_enters_explicit_confirmation(self):
+    def test_bare_clock_uses_nearest_future_time(self):
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "吃饭", "date_text": "今天",
-                "time_text": "十一点半", "remind_text": None,
-            }],
+            "intent": "create", "items": [_todo(
+                "吃饭", {"kind": "none"}, _clock(11, 30),
+            )],
         }, "", self.now)
-        self.assertIn("待办时间需要确认", reply)
-        self.assertIn("真实 @robot", reply)
-        self.assertIsNotNone(self.worker.storage.clarification)
+        self.assertIn("【时间】2026-09-10 23:30", reply)
+        self.assertIn("【编号】#12", reply)
+        self.assertIsNone(self.worker.storage.clarification)
 
     def test_chat_cannot_claim_todo_was_created(self):
         reply = self.worker._handle_command(self.row, {
@@ -238,20 +257,28 @@ class TodoFlowTest(unittest.TestCase):
             }],
         }
         reply = self.worker._handle_command(self.row, {
-            "intent": "create", "items": [{
-                "title": "打游戏", "date_text": "今天",
-                "time_text": "晚上十点", "remind_text": None,
-            }],
+            "intent": "create", "items": [_todo(
+                "打游戏", {"kind": "today"}, _clock(10, period="evening"),
+            )],
         }, "", self.now)
         self.assertIn("同一时间已有其他待办", reply)
         self.assertIn("真实 @robot", reply)
+
+    def test_delete_by_number_prepares_exact_candidate(self):
+        reply = self.worker._handle_command(self.row, {
+            "intent": "delete", "todo_id": 12,
+            "range_start": None, "range_end": None, "keyword": None,
+        }, "")
+        self.assertIn("请确认删除", reply)
+        self.assertIn("【编号】#12", reply)
+        self.assertEqual(self.worker.storage.delete_args[-1], 12)
 
     def test_confirm_replace(self):
         reply = self.worker._handle_command(
             self.row, {"intent": "confirm_replace"}, "",
         )
         self.assertIn("待办替换成功", reply)
-        self.assertIn("📌 事项：打游戏", reply)
+        self.assertIn("【待办】打游戏", reply)
 
     def test_list_is_scoped_to_sender(self):
         reply = self.worker._handle_command(self.row, {
@@ -272,18 +299,9 @@ class TodoFlowTest(unittest.TestCase):
             "event_at": _parse_datetime("2026-09-09T17:05:00+08:00"),
             "event_all_day": False,
         }
-        self.assertEqual(_format_reminder(todo, now), """⏰ 待办提醒
-
-📌 开会
-
-👤 发起人：张三
-
-执行时间：
-今天 17:05
-
-请及时处理。
-
-编号：#3""")
+        self.assertEqual(_format_reminder(todo, now), """【待办】开会
+【时间】今天 17:05
+【发起人】张三""")
 
 
 if __name__ == "__main__":

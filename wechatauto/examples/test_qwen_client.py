@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wechatauto.qwen_client import QwenClient
+from wechatauto.qwen_client import PROMPT_FILE, QwenClient, render_prompt
 
 
 class _FakeClient(QwenClient):
@@ -21,6 +21,14 @@ class _FakeClient(QwenClient):
 
 
 class QwenClientTest(unittest.TestCase):
+    def test_prompts_are_loaded_from_central_file(self):
+        self.assertTrue(PROMPT_FILE.is_file())
+        rendered = render_prompt(
+            "todo_interpret", now_iso="2026-09-12T10:00:00+08:00", text="测试消息",
+        )
+        self.assertIn("当前北京时间：2026-09-12T10:00:00+08:00", rendered)
+        self.assertIn("用户消息：测试消息", rendered)
+
     def test_transcribe_uses_base64_data_uri(self):
         client = _FakeClient()
         with tempfile.TemporaryDirectory() as directory:
@@ -52,14 +60,23 @@ class QwenClientTest(unittest.TestCase):
             "choices": [{"message": {"content": (
                 '{"intent":"create","title":"开会",'
                 '"date_text":"明天","time_text":"下午三点",'
-                '"remind_text":"提前30分钟"}'
+                '"remind_text":"提前30分钟",'
+                '"date_semantic":{"kind":"relative_days","value":1},'
+                '"time_semantic":{"kind":"clock","hour":3,"minute":0,'
+                '"day_period":"afternoon","is_24_hour":false,"near_future":false},'
+                '"reminder_semantic":{"kind":"before_event","value":30,'
+                '"unit":"minutes"}}'
             )}}],
         }
         result = client.interpret("今晚八点开会", "2026-09-09T10:00:00+08:00")
         self.assertEqual(len(result["items"]), 1)
         self.assertEqual(result["items"][0]["title"], "开会")
+        self.assertEqual(
+            result["items"][0]["date_semantic"],
+            {"kind": "relative_days", "value": 1},
+        )
 
-    def test_interpret_prompt_requires_raw_time_semantics(self):
+    def test_interpret_prompt_requires_structured_time_semantics(self):
         client = _FakeClient()
         captured = {}
 
@@ -74,6 +91,15 @@ class QwenClientTest(unittest.TestCase):
         self.assertIn("time_text", instruction)
         self.assertIn("remind_text", instruction)
         self.assertIn("target_text", instruction)
+        self.assertIn("date_semantic", instruction)
+        self.assertIn("time_semantic", instruction)
+        self.assertIn("reminder_semantic", instruction)
+        self.assertIn("N个月后", instruction)
+        self.assertIn("等会儿三点半", instruction)
+        self.assertIn("十一点半", instruction)
+        self.assertIn("最近的未来11:30或23:30", instruction)
+        self.assertIn("三个 semantic 字段必须是 kind=none 的对象", instruction)
+        self.assertIn("删除编号12的待办", instruction)
         self.assertIn("提醒李工去铺线", instruction)
         self.assertIn("不得返回 event_at、remind_at", instruction)
         self.assertNotIn("create_failed", instruction)

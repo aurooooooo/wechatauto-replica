@@ -837,7 +837,7 @@ class ArchiveStorage:
             return result.rowcount > 0
 
     @staticmethod
-    def _todo_where(start_at, end_at, keyword):
+    def _todo_where(start_at, end_at, keyword, todo_id=None):
         clauses = ["account_id=%s", "creator_id=%s", "status='active'"]
         values = []
         if start_at is not None:
@@ -849,6 +849,9 @@ class ArchiveStorage:
         if keyword:
             clauses.append("title ILIKE %s")
             values.append("%%%s%%" % keyword)
+        if todo_id is not None:
+            clauses.append("id=%s")
+            values.append(todo_id)
         return " AND ".join(clauses), values
 
     def list_todos(
@@ -859,8 +862,9 @@ class ArchiveStorage:
         end_at=None,
         keyword: Optional[str] = None,
         limit: int = 50,
+        todo_id: Optional[int] = None,
     ) -> List[dict]:
-        where, values = self._todo_where(start_at, end_at, keyword)
+        where, values = self._todo_where(start_at, end_at, keyword, todo_id)
         with self._connect() as conn:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
@@ -878,9 +882,11 @@ class ArchiveStorage:
         start_at=None,
         end_at=None,
         keyword: Optional[str] = None,
+        todo_id: Optional[int] = None,
     ) -> List[dict]:
         candidates = self.list_todos(
-            account_id, creator_id, start_at, end_at, keyword, limit=20,
+            account_id, creator_id, start_at, end_at, keyword,
+            limit=20, todo_id=todo_id,
         )
         with self._connect() as conn:
             conn.execute(
