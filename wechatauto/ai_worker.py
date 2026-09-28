@@ -62,6 +62,18 @@ def _format_todo(todo: dict) -> str:
     lines = ["【待办】%s" % todo["title"], "【时间】%s" % event]
     if todo.get("session_type") == "group" and todo.get("reminder_target_name"):
         lines.append("【对象】%s" % todo["reminder_target_name"])
+        target_id = todo.get("reminder_target_id")
+        creator_id = todo.get("creator_id")
+        target_name = todo.get("reminder_target_name")
+        creator_name = todo.get("creator_name") or creator_id
+        other_member = (
+            target_id and creator_id and target_id != creator_id
+        ) or (
+            not target_id and not creator_id and creator_name
+            and target_name != creator_name
+        )
+        if other_member and creator_name:
+            lines.append("【创建人】%s" % creator_name)
     lines.extend(("【提醒】%s" % reminder, "【编号】#%s" % todo["id"]))
     return "\n".join(lines)
 

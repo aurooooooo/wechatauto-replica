@@ -51,6 +51,8 @@ class _Storage:
                 "remind_at": item["remind_at"],
                 "session_type": message["session_type"],
                 "origin_session_name": message["session_name"],
+                "creator_id": message["sender_id"],
+                "creator_name": message["sender_name"],
                 "reminder_target_id": item["reminder_target_id"],
                 "reminder_target_name": item["reminder_target_name"],
             } for index, item in enumerate(items)],
@@ -194,6 +196,7 @@ class TodoFlowTest(unittest.TestCase):
             )],
         }, "", self.now)
         self.assertIn("【对象】恸。", reply)
+        self.assertIn("【创建人】张三", reply)
         self.assertEqual(
             self.worker.storage.created_items[0]["reminder_target_id"], "worker_wxid",
         )
