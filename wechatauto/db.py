@@ -1012,7 +1012,20 @@ class WeChatDB:
                 except OSError:
                     pass
         else:
-            raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
+            # 微信持续写入时可能始终赶不上一个静止的 WAL 窗口。继续使用
+            # 上一次已校验的原子缓存，下一轮轮询再追新状态，避免整个会话反复报错。
+            # Listener 的水位只根据查询结果推进，因此读旧快照不会跳过新消息。
+            if os.path.isfile(dst):
+                if rel not in self._validated_cache:
+                    if self._check_merged(dst):
+                        self._validated_cache.add(rel)
+                if rel in self._validated_cache:
+                    return self._open_readonly_cache(dst)
+            raise RuntimeError("数据库持续变化，且没有可用的已校验缓存: %s" % rel)
+        return self._open_readonly_cache(dst)
+
+    @staticmethod
+    def _open_readonly_cache(dst: str) -> sqlite3.Connection:
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _sqlite_text_factory
