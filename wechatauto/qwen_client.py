@@ -131,6 +131,16 @@ class QwenClient:
             return [QwenClient._normalize_json_keys(item) for item in value]
         return value
 
+    @staticmethod
+    def _unwrap_semantic_schema(value):
+        """解开模型误返回的 JSON Schema properties 包装。"""
+        while (
+            isinstance(value, dict)
+            and isinstance(value.get("properties"), dict)
+        ):
+            value = value["properties"]
+        return value
+
     def _json_request(
         self,
         url: str,
@@ -286,6 +296,14 @@ class QwenClient:
                     "title", "date_text", "time_text", "remind_text", "target_text",
                     "date_semantic", "time_semantic", "reminder_semantic",
                 )}]
+            for item in items:
+                if isinstance(item, dict):
+                    for field in (
+                        "date_semantic", "time_semantic", "reminder_semantic",
+                    ):
+                        item[field] = self._unwrap_semantic_schema(
+                            item.get(field),
+                        )
             result["items"] = items
         self._log(
             "info",

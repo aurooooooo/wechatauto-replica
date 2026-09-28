@@ -108,6 +108,27 @@ class QwenClientTest(unittest.TestCase):
         self.assertEqual(item["time_semantic"]["minute"], 30)
         self.assertEqual(item["reminder_semantic"]["value"], 30)
 
+    def test_interpret_unwraps_semantic_json_schema(self):
+        client = _FakeClient()
+        client._json_request = lambda *args, **kwargs: {
+            "choices": [{"message": {"content": (
+                '{"intent":"create","items":[{"title":"吃饭",'
+                '"date_semantic":{"type":"array","title":"DateSemantic",'
+                '"properties":{"kind":"today"}},'
+                '"time_semantic":{"type":"array","title":"TimeSemantic",'
+                '"properties":{"kind":"clock","hour":6,"minute":0,'
+                '"day_period":"afternoon","is_24_hour":false}},'
+                '"reminder_semantic":{"type":"array",'
+                '"title":"ReminderSemantic","properties":{'
+                '"kind":"before_event","value":30,"unit":"minutes"}}}]}'
+            )}}],
+        }
+        result = client.interpret("今天下午六点吃饭", "2026-09-28T16:00:00+08:00")
+        item = result["items"][0]
+        self.assertEqual(item["date_semantic"], {"kind": "today"})
+        self.assertEqual(item["time_semantic"]["hour"], 6)
+        self.assertEqual(item["reminder_semantic"]["value"], 30)
+
     def test_interpret_prompt_requires_structured_time_semantics(self):
         client = _FakeClient()
         captured = {}
