@@ -22,7 +22,14 @@ foreach ($Line in Get-Content -LiteralPath $EnvFile -Encoding UTF8) {
 
 Push-Location $ProjectDir
 try {
-    python -u -m wechatauto.listen_messages --all @args
+    $Python = Join-Path $ProjectDir ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $Python)) {
+        $Python = (Get-Command python -ErrorAction Stop).Source
+    }
+    & $Python -u -m wechatauto.listen_messages --all @args
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 finally {
     Pop-Location

@@ -603,8 +603,8 @@ class ArchiveStorage:
         return cur.fetchone()
 
     def create_todos(self, message: dict, items: List[dict]) -> dict:
-        """批量创建；同时间同标题更新，不同标题等待用户确认替换。"""
-        created, updated, conflicts, replacements = [], [], [], []
+        """批量创建；同对象同时间同标题更新，其他事项保留并提示。"""
+        created, updated, conflicts = [], [], []
         with self._connect() as conn:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
@@ -616,15 +616,20 @@ class ArchiveStorage:
                     (message["account_id"], message["sender_id"], message["session_id"]),
                 )
                 for index, item in enumerate(items):
+                    target_id = item.get("reminder_target_id") or message["sender_id"]
                     cur.execute(
                         """
                         SELECT * FROM wechat_todos
-                        WHERE account_id=%s AND creator_id=%s AND event_at=%s
+                        WHERE account_id=%s AND creator_id=%s
+                          AND reminder_target_id=%s AND event_at=%s
                           AND status='active'
                         ORDER BY id
                         FOR UPDATE
                         """,
-                        (message["account_id"], message["sender_id"], item["event_at"]),
+                        (
+                            message["account_id"], message["sender_id"],
+                            target_id, item["event_at"],
+                        ),
                     )
                     existing = list(cur.fetchall())
                     same = [todo for todo in existing if self._normalized_title(todo["title"])
@@ -658,24 +663,9 @@ class ArchiveStorage:
                         updated.append(cur.fetchone())
                     elif existing:
                         conflicts.append({"existing": existing, "new": item})
-                        replacements.append(self._replacement_json(item, index, existing))
+                        created.append(self._insert_todo(cur, message, item, index))
                     else:
                         created.append(self._insert_todo(cur, message, item, index))
-                if replacements:
-                    cur.execute(
-                        """
-                        INSERT INTO wechat_todo_replace_requests (
-                            account_id, creator_id, session_id, source_message_id,
-                            replacements, expires_at
-                        ) VALUES (%s, %s, %s, %s, %s::jsonb,
-                            NOW() + INTERVAL '15 minutes')
-                        """,
-                        (
-                            message["account_id"], message["sender_id"],
-                            message["session_id"], message["id"],
-                            json.dumps(replacements, ensure_ascii=False),
-                        ),
-                    )
         return {"created": created, "updated": updated, "conflicts": conflicts}
 
     def has_pending_todo_replace(

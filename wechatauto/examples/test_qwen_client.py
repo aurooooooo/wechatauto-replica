@@ -54,6 +54,16 @@ class QwenClientTest(unittest.TestCase):
             "list",
         )
 
+    def test_interpret_accepts_help_intent(self):
+        client = _FakeClient()
+        client._json_request = lambda *args, **kwargs: {
+            "choices": [{"message": {"content": '{"intent":"help"}'}}],
+        }
+        self.assertEqual(
+            client.interpret("你能做什么", "2026-09-09T10:00:00+08:00")["intent"],
+            "help",
+        )
+
     def test_interpret_normalizes_single_semantic_todo(self):
         client = _FakeClient()
         client._json_request = lambda *args, **kwargs: {
@@ -97,12 +107,21 @@ class QwenClientTest(unittest.TestCase):
         self.assertIn("N个月后", instruction)
         self.assertIn("等会儿三点半", instruction)
         self.assertIn("十一点半", instruction)
-        self.assertIn("最近的未来11:30或23:30", instruction)
-        self.assertIn("三个 semantic 字段必须是 kind=none 的对象", instruction)
+        self.assertIn("最近未来11:30/23:30", instruction)
+        self.assertIn("下午两点半", instruction)
+        self.assertIn("按当前北京时间选择最近的未来时间", instruction)
+        self.assertIn("before_event(value=30,unit=minutes)", instruction)
+        self.assertIn("三个semantic字段始终为对象", instruction)
         self.assertIn("删除编号12的待办", instruction)
-        self.assertIn("提醒李工去铺线", instruction)
-        self.assertIn("不得返回 event_at、remind_at", instruction)
+        self.assertIn("提醒李工去", instruction)
+        self.assertIn("不返回event_at/remind_at", instruction)
         self.assertNotIn("create_failed", instruction)
+
+    def test_help_prompt_is_fixed_content(self):
+        help_text = render_prompt("todo_help")
+        self.assertIn("我能帮你做这些事", help_text)
+        self.assertIn("删除编号12的待办", help_text)
+        self.assertIn("提前30分钟", help_text)
 
     def test_json_request_retries_one_timeout(self):
         class _Response:

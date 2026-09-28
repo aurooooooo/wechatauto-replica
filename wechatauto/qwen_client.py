@@ -34,10 +34,9 @@ def render_prompt(name: str, **values) -> str:
         template = _prompt_config().get(name, "template").strip()
     except Exception as exc:
         raise RuntimeError("Prompt 配置缺少有效段落：%s" % name) from exc
-    try:
-        return template.format(**values)
-    except KeyError as exc:
-        raise RuntimeError("Prompt %s 缺少模板变量：%s" % (name, exc.args[0])) from exc
+    for key, value in values.items():
+        template = template.replace("{%s}" % key, str(value))
+    return template
 
 class QwenClient:
     def __init__(
@@ -137,7 +136,7 @@ class QwenClient:
         except json.JSONDecodeError as exc:
             raise RuntimeError("千问意图解析返回了无效 JSON") from exc
         if result.get("intent") not in {
-            "create", "list", "delete", "confirm_delete", "cancel_delete",
+            "help", "create", "list", "delete", "confirm_delete", "cancel_delete",
             "confirm_replace", "cancel_replace", "chat",
         }:
             raise RuntimeError("千问返回了未知意图")

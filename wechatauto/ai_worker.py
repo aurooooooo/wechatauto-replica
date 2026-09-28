@@ -14,7 +14,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from wechatauto.qwen_client import (
-    QwenClient, reply_prompt, reply_trigger,
+    QwenClient, render_prompt, reply_prompt, reply_trigger,
 )
 from wechatauto import WeChatDB
 from wechatauto.send_text import resolve_group_member, send_text
@@ -72,20 +72,31 @@ def _format_create_result(result: dict, session_type: str) -> str:
         for conflict in result["conflicts"]:
             new = conflict["new"]
             new_time = _format_time(new["event_at"], bool(new.get("event_all_day")))
+            existing_todos = conflict["existing"]
             existing = "、".join(
                 "#%s %s" % (todo["id"], todo["title"])
-                for todo in conflict["existing"]
+                for todo in existing_todos
             )
-            details.append("【时间】%s\n【已有】%s\n【新待办】%s" % (
-                new_time, existing, new["title"],
+            target_name = new.get("reminder_target_name") or (
+                existing_todos[0].get("reminder_target_name")
+                if existing_todos else None
+            )
+            target_line = "\n【对象】%s" % target_name if target_name else ""
+            details.append("【时间】%s%s\n【已有】%s\n【新待办】%s" % (
+                new_time, target_line, existing, new["title"],
             ))
+        example_id = result["conflicts"][0]["existing"][0]["id"]
         instruction = (
-            "请在15分钟内重新真实 @robot 并回复“是”或“取消”。"
+            "如需删除已有事项，请重新真实 @robot 发送“删除编号#%s的待办”；"
+            "系统会先要求确认。"
+            % example_id
             if session_type == "group"
-            else "请在15分钟内回复“robot 是”或“robot 取消”。"
+            else "如需删除已有事项，请重新发送“robot 删除编号#%s的待办”；"
+            "系统会先要求确认。"
+            % example_id
         )
         sections.append(
-            "⚠️ 同一时间已有其他待办，是否替换？\n"
+            "⚠️ 同一提醒对象同一时间已有其他待办，新待办已保留\n"
             + "\n——\n".join(details) + "\n【操作】" + instruction
         )
     return "\n".join(sections)
@@ -114,8 +125,9 @@ def _format_create_failure(session_type: str, reason: str = "时间信息不够�
     )
     return (
         "❌ 待办创建失败\n【原因】%s\n"
-        "【规则】请重新触发机器人，并写明日期、具体时段和事项；"
-        "未写提前量时默认在任务时间提醒。\n【示例】%s"
+        "【规则】请重新触发机器人，并写明具体时间和事项；"
+        "未明确日期时按最近的未来时间处理；未写提前量时默认在任务时间提醒；"
+        "只说“提前提醒”时默认提前30分钟。\n【示例】%s"
     ) % (reason, example)
 
 
@@ -198,6 +210,8 @@ class AIWorker:
         self, row: dict, command: dict, prompt: str, now: datetime | None = None,
     ) -> str:
         intent = command["intent"]
+        if intent == "help":
+            return render_prompt("todo_help")
         if intent == "chat":
             reply = command.get("reply") or self.client.chat(prompt)
             return _format_create_failure(row["session_type"]) if _claims_todo_created(reply) else reply

@@ -123,6 +123,11 @@ class TimeResolverTest(unittest.TestCase):
         result = self.resolve(NONE, self.clock(11, 30), now=now)
         self.assertEqual(result["event_at"], "2026-09-10T11:30:00+08:00")
 
+    def test_bare_afternoon_clock_uses_nearest_future_time(self):
+        now = datetime(2026, 9, 10, 13, 0, tzinfo=SHANGHAI)
+        result = self.resolve(NONE, self.clock(2, 30, "afternoon"), now=now)
+        self.assertEqual(result["event_at"], "2026-09-10T14:30:00+08:00")
+
     def test_bare_eleven_thirty_at_six_uses_evening(self):
         now = datetime(2026, 9, 10, 18, 0, tzinfo=SHANGHAI)
         result = self.resolve(NONE, self.clock(11, 30), now=now)

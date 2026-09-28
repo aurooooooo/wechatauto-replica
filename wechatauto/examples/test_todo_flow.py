@@ -111,6 +111,14 @@ class TodoFlowTest(unittest.TestCase):
             "session_name": "项目群", "session_type": "group",
         }
 
+    def test_help_returns_fixed_content(self):
+        reply = self.worker._handle_command(
+            self.row, {"intent": "help"}, "",
+        )
+        self.assertIn("我能帮你做这些事", reply)
+        self.assertIn("同一个提醒对象在同一时间", reply)
+        self.assertIn("普通问题可以直接询问我", reply)
+
     def test_create_returns_structured_overview_for_creator(self):
         reply = self.worker._handle_command(self.row, {
             "intent": "create", "items": [_todo(
@@ -246,14 +254,24 @@ class TodoFlowTest(unittest.TestCase):
         }, "")
         self.assertIn("待办创建失败", reply)
 
-    def test_conflict_asks_for_real_group_mention(self):
+    def test_conflict_warns_and_keeps_new_todo(self):
         event_at = _parse_datetime("2026-09-10T22:00:00+08:00")
         self.worker.storage.create_result = {
-            "created": [], "updated": [],
+            "created": [{
+                "id": 4, "title": "打游戏", "event_at": event_at,
+                "event_all_day": False, "remind_at": event_at,
+                "session_type": "group", "reminder_target_name": "张三",
+            }],
+            "updated": [],
             "conflicts": [{
-                "existing": [{"id": 3, "title": "开会"}],
-                "new": {"title": "打游戏", "event_at": event_at,
-                        "event_all_day": False},
+                "existing": [{
+                    "id": 3, "title": "开会",
+                    "reminder_target_name": "张三",
+                }],
+                "new": {
+                    "title": "打游戏", "event_at": event_at,
+                    "event_all_day": False, "reminder_target_name": "张三",
+                },
             }],
         }
         reply = self.worker._handle_command(self.row, {
@@ -261,8 +279,9 @@ class TodoFlowTest(unittest.TestCase):
                 "打游戏", {"kind": "today"}, _clock(10, period="evening"),
             )],
         }, "", self.now)
-        self.assertIn("同一时间已有其他待办", reply)
-        self.assertIn("真实 @robot", reply)
+        self.assertIn("待办创建成功", reply)
+        self.assertIn("同一提醒对象同一时间已有其他待办", reply)
+        self.assertIn("删除编号#3的待办", reply)
 
     def test_delete_by_number_prepares_exact_candidate(self):
         reply = self.worker._handle_command(self.row, {
