@@ -2,8 +2,10 @@ from .param import WxParam
 
 import logging
 import colorama
+import os
 from pathlib import Path
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 
 
 colorama.init()
@@ -16,6 +18,44 @@ LOG_COLORS = {
     'CRITICAL': colorama.Fore.MAGENTA
 }
 
+
+LOG_RETENTION_DAYS = 60
+DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+class WeeklyFileHandler(TimedRotatingFileHandler):
+    """按周轮转，并清理超过保留期限的历史日志。"""
+
+    def __init__(self, filename, retention_days=LOG_RETENTION_DAYS, **kwargs):
+        self.retention_days = retention_days
+        self.log_dir = Path(filename).resolve().parent
+        super().__init__(
+            filename,
+            when="W0",
+            interval=1,
+            backupCount=0,
+            encoding="utf-8",
+            delay=True,
+            **kwargs,
+        )
+        self.cleanup_old_logs()
+
+    def doRollover(self):
+        super().doRollover()
+        self.cleanup_old_logs()
+
+    def cleanup_old_logs(self):
+        cutoff = datetime.now().timestamp() - self.retention_days * 24 * 60 * 60
+        prefix = Path(self.baseFilename).name + "."
+        for path in self.log_dir.glob(prefix + "*"):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                # 日志清理失败不能影响主程序运行。
+                continue
+
+
 class ColoredFormatter(logging.Formatter):
     def format(self, record):
         levelname = record.levelname
@@ -27,7 +67,7 @@ class WechatautoLogger:
 
     def __init__(self):
         self.logger = self.setup_logger()
-        self.file_handler = None  # 先不创建文件处理器
+        self.file_handler = None
         self.set_debug(False)
 
     def setup_logger(self) -> logging.Logger:
@@ -64,19 +104,15 @@ class WechatautoLogger:
         return logging.getLogger(self.name)
 
     def setup_file_logger(self):
-        """根据WxParam.ENABLE_FILE_LOGGER决定是否创建文件日志处理器"""
+        """创建固定目录下的按周轮转文件日志处理器。"""
         if not WxParam.ENABLE_FILE_LOGGER or self.file_handler is not None:
             return
 
-        # 文件处理器（无颜色）
-        log_dir = Path("wechatauto_logs")
+        log_dir = Path(os.environ.get("WECHATAUTO_LOG_DIR") or DEFAULT_LOG_DIR)
         log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "wechatauto.log"
 
-        # 使用当前时间创建日志文件
-        current_time = datetime.now().strftime("%Y%m%d")
-        log_file = log_dir / f"app_{current_time}.log"
-
-        self.file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        self.file_handler = WeeklyFileHandler(log_file)
         file_formatter = logging.Formatter(
             '%(asctime)s [%(name)s] [%(levelname)s] [%(filename)s:%(lineno)d]  %(message)s',
             datefmt="%Y-%m-%d %H:%M:%S"
@@ -119,5 +155,5 @@ class WechatautoLogger:
         self._ensure_file_logger()  # 确保文件日志初始化
         self.logger.critical(msg, *args, stacklevel=stacklevel, **kwargs)
 
-# wxlog实例化的地方不再创建文件日志
+# 文件日志在第一次写入时初始化，避免导入模块时创建目录。
 wxlog = WechatautoLogger()

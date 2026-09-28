@@ -18,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+from wechatauto.logger import wxlog
+
 PROMPT_FILE = Path(__file__).with_name("prompts.ini")
 
 
@@ -72,6 +74,51 @@ class QwenClient:
             timeout=int(os.environ.get("QWEN_HTTP_TIMEOUT", "120")),
         )
 
+    @staticmethod
+    def _log(level: str, message: str) -> None:
+        try:
+            getattr(wxlog, level)(message)
+        except Exception:
+            # 日志异常不能覆盖模型请求本身的错误。
+            pass
+
+    @staticmethod
+    def _log_payload(payload):
+        """记录请求结构，但不把语音 base64 写入日志。"""
+        if not isinstance(payload, dict):
+            return payload
+        result = dict(payload)
+        messages = []
+        for message in payload.get("messages", []):
+            if not isinstance(message, dict):
+                messages.append(message)
+                continue
+            logged_message = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                logged_content = []
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "input_audio"
+                        and isinstance(part.get("input_audio"), dict)
+                    ):
+                        audio = part["input_audio"]
+                        logged_content.append({
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": "<base64 omitted; chars=%d>"
+                                % len(str(audio.get("data") or "")),
+                            },
+                        })
+                    else:
+                        logged_content.append(part)
+                logged_message["content"] = logged_content
+            messages.append(logged_message)
+        if "messages" in payload:
+            result["messages"] = messages
+        return result
+
     def _json_request(
         self,
         url: str,
@@ -84,21 +131,53 @@ class QwenClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = Request(url, data=data, headers=headers, method=method)
+        self._log(
+            "debug",
+            "QWEN_REQUEST method=%s url=%s payload=%s"
+            % (
+                method,
+                url,
+                json.dumps(
+                    self._log_payload(payload),
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            ),
+        )
         for attempt in range(2):
             try:
                 with urlopen(request, timeout=self.timeout) as response:
                     result = json.loads(response.read().decode("utf-8"))
+                    self._log(
+                        "debug",
+                        "QWEN_RESPONSE attempt=%d url=%s body=%s"
+                        % (
+                            attempt + 1,
+                            url,
+                            json.dumps(result, ensure_ascii=False, default=str),
+                        ),
+                    )
                     if self._is_billing_error(result):
                         raise QwenBillingError("千问账户余额不足或已欠费")
                     return result
             except HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")[:2000]
+                self._log(
+                    "error",
+                    "QWEN_HTTP_ERROR attempt=%d url=%s status=%s body=%r"
+                    % (attempt + 1, url, exc.code, body),
+                )
                 if exc.code == 402 or self._is_billing_error(body):
                     raise QwenBillingError("千问账户余额不足或已欠费") from exc
                 if attempt == 0 and (exc.code == 429 or exc.code >= 500):
                     continue
                 raise RuntimeError("千问接口返回 HTTP %s：%s" % (exc.code, body)) from exc
             except (TimeoutError, socket.timeout, URLError) as exc:
+                self._log(
+                    "error",
+                    "QWEN_NETWORK_ERROR attempt=%d url=%s error=%r"
+                    % (attempt + 1, url, exc),
+                )
                 if attempt == 0:
                     continue
                 raise RuntimeError("千问接口请求失败（已重试1次）：%s" % exc) from exc
@@ -135,6 +214,7 @@ class QwenClient:
         return str(value)
 
     def chat(self, prompt: str) -> str:
+        self._log("info", "QWEN_CHAT_INPUT prompt=%r" % prompt)
         response = self._json_request(
             self.compatible_base_url + "/chat/completions",
             method="POST",
@@ -149,11 +229,17 @@ class QwenClient:
             raise RuntimeError("千问文本回复缺少 choices[0].message.content") from exc
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("千问返回了空文本")
+        self._log("info", "QWEN_CHAT_OUTPUT content=%r" % content.strip())
         return content.strip()
 
     def interpret(self, text: str, now_iso: str) -> dict:
         """将触发消息解析为聊天或待办命令。"""
         instruction = render_prompt("todo_interpret", now_iso=now_iso, text=text)
+        self._log(
+            "info",
+            "QWEN_INTERPRET_INPUT now=%s user_text=%r prompt=%r"
+            % (now_iso, text, instruction),
+        )
         response = self._json_request(
             self.compatible_base_url + "/chat/completions",
             method="POST",
@@ -187,6 +273,14 @@ class QwenClient:
                     "date_semantic", "time_semantic", "reminder_semantic",
                 )}]
             result["items"] = items
+        self._log(
+            "info",
+            "QWEN_INTERPRET_OUTPUT raw_content=%r parsed_command=%s"
+            % (
+                content,
+                json.dumps(result, ensure_ascii=False, default=str),
+            ),
+        )
         return result
 
     def transcribe_file(self, file_path: str, mime_type: Optional[str] = None) -> str:
@@ -197,6 +291,11 @@ class QwenClient:
         if path.stat().st_size > max_bytes:
             raise ValueError("音频文件超过 qwen3-asr-flash 的 10 MB 限制")
         mime = mime_type or mimetypes.guess_type(str(path))[0] or "audio/wav"
+        self._log(
+            "info",
+            "QWEN_ASR_INPUT file=%s mime=%s bytes=%d"
+            % (path, mime, path.stat().st_size),
+        )
         data_uri = "data:%s;base64,%s" % (
             mime, base64.b64encode(path.read_bytes()).decode("ascii"),
         )
@@ -221,6 +320,7 @@ class QwenClient:
             raise RuntimeError("语音转写响应缺少 choices[0].message.content") from exc
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("语音转写结果为空")
+        self._log("info", "QWEN_ASR_OUTPUT transcript=%r" % content.strip())
         return content.strip()
 
 

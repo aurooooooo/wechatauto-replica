@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import threading
+import traceback
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -208,8 +209,9 @@ class AIWorker:
             )
             self.storage.mark_asr_ready(row["id"], transcript, triggered)
             self.log(
-                "ASR", "%s | %s | 转写完成，字符数=%d" % (
-                    row["session_name"], row["sender_name"], len(transcript),
+                "ASR", "%s | %s | 转写完成，字符数=%d，内容=%r" % (
+                    row["session_name"], row["sender_name"],
+                    len(transcript), transcript,
                 ),
             )
         except QwenBillingError as exc:
@@ -224,8 +226,9 @@ class AIWorker:
         except Exception as exc:
             self.storage.mark_asr_failure(row["id"], str(exc))
             self.log(
-                "ASR_ERROR", "%s/%s：%s" % (
+                "ASR_ERROR", "%s/%s：%s\n%s" % (
                     row["session_id"], row["local_id"], exc,
+                    traceback.format_exc(),
                 ),
             )
         finally:
@@ -267,6 +270,13 @@ class AIWorker:
             for raw in raw_items:
                 if not isinstance(raw, dict):
                     return "未能识别完整的待办事项和时间，请补充后重新发送。"
+                self.log(
+                    "TODO_ITEM_INPUT",
+                    "%s/%s 原始待办=%s" % (
+                        row["session_id"], row.get("local_id"),
+                        json.dumps(raw, ensure_ascii=False, default=str),
+                    ),
+                )
                 title = str(raw.get("title") or "").strip()
                 if not title:
                     return "未能识别完整的待办事项和时间，请补充后重新发送。"
@@ -274,6 +284,14 @@ class AIWorker:
                     raw, now or datetime.now(SHANGHAI),
                 )
                 if resolution["status"] == "failed":
+                    self.log(
+                        "TODO_TIME_ERROR",
+                        "%s/%s 原始待办=%s 解析结果=%s" % (
+                            row["session_id"], row.get("local_id"),
+                            json.dumps(raw, ensure_ascii=False, default=str),
+                            json.dumps(resolution, ensure_ascii=False, default=str),
+                        ),
+                    )
                     return _format_create_failure(
                         row["session_type"], resolution["reason"],
                     )
@@ -415,7 +433,20 @@ class AIWorker:
                 command = self.client.interpret(
                     prompt, now.isoformat(timespec="seconds"),
                 )
+            self.log(
+                "AI_COMMAND",
+                "%s/%s 输入=%r 命令=%s" % (
+                    row["session_id"], row.get("local_id"), source,
+                    json.dumps(command, ensure_ascii=False, default=str),
+                ),
+            )
             reply = self._handle_command(row, command, prompt, now)
+            self.log(
+                "AI_REPLY_RESULT",
+                "%s/%s 回复=%r" % (
+                    row["session_id"], row.get("local_id"), reply,
+                ),
+            )
             self.storage.mark_reply_ready(row["id"], reply)
             if not self.storage.claim_ready_reply(row["id"]):
                 return True
@@ -437,8 +468,9 @@ class AIWorker:
         except Exception as exc:
             self.storage.mark_reply_failure(row["id"], str(exc))
             self.log(
-                "AUTO_REPLY_ERROR", "%s/%s：%s" % (
+                "AUTO_REPLY_ERROR", "%s/%s：%s\n%s" % (
                     row["session_id"], row["local_id"], exc,
+                    traceback.format_exc(),
                 ),
             )
         return True
@@ -461,7 +493,10 @@ class AIWorker:
             ))
         except Exception as exc:
             self.storage.mark_reminder_failure(todo["id"], str(exc))
-            self.log("REMINDER_ERROR", "#%s：%s" % (todo["id"], exc))
+            self.log(
+                "REMINDER_ERROR",
+                "#%s：%s\n%s" % (todo["id"], exc, traceback.format_exc()),
+            )
         return True
 
     def _run(self) -> None:
@@ -474,5 +509,8 @@ class AIWorker:
                 if not did_work:
                     self._stop.wait(1)
             except Exception as exc:
-                self.log("AI_WORKER_ERROR", str(exc))
+                self.log(
+                    "AI_WORKER_ERROR",
+                    "%s\n%s" % (exc, traceback.format_exc()),
+                )
                 self._stop.wait(3)

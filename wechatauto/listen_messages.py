@@ -23,6 +23,7 @@ from wechatauto.ai_worker import AIWorker
 from wechatauto.db import Listener, WeChatDB
 from wechatauto.qwen_client import mentioned_user_ids, reply_trigger
 from wechatauto.storage import ArchiveStorage, MediaArchiveWorker
+from wechatauto.logger import wxlog
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -35,8 +36,7 @@ DEFAULT_DB_DIR = os.environ.get("WECHAT_DB_DIR", r"D:\xwechat_files")
 
 
 def operation_log(step: str, message: str) -> None:
-    now = time.strftime("%H:%M:%S")
-    print("[%s] [%s] %s" % (now, step, message), file=sys.stderr, flush=True)
+    wxlog.info("[%s] %s", step, message)
 
 
 class DisplayNames:
@@ -179,13 +179,13 @@ def make_log_callback(names: DisplayNames):
         quote = parse_quote_message(context["content"])
         content = (quote["content"] if quote else context["content"])
         content = content.replace("\r", "").replace("\n", "\\n")
-        print(
-            "[%s] %s | %s | %s | %s"
+        operation_log(
+            "WECHAT_MESSAGE",
+            "%s | %s | %s | %s | %s"
             % (
                 timestamp, context["session_name"], context["sender_name"],
                 "引用文本" if quote else message.get("type"), content,
             ),
-            flush=True,
         )
 
     return on_message
