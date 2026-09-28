@@ -54,6 +54,19 @@ def _list_date_range(text: str, now: datetime):
     return start, start + timedelta(days=1)
 
 
+def _list_scope(text: str, model_scope=None) -> str:
+    """为明确的查询范围提供程序侧兜底，避免模型漏掉“我创建的”。"""
+    text = text or ""
+    created = any(marker in text for marker in ("我创建", "我添加", "我设置", "我建立"))
+    assigned = any(marker in text for marker in ("提醒我的", "提醒我", "给我安排"))
+    if created and not assigned:
+        return "created"
+    if assigned and not created:
+        return "assigned"
+    model_scope = str(model_scope or "").strip().lower()
+    return model_scope if model_scope in {"all", "created", "assigned"} else "all"
+
+
 def _format_todo(todo: dict) -> str:
     event = _format_time(todo["event_at"], bool(todo.get("event_all_day")))
     reminder = (
@@ -372,9 +385,10 @@ class AIWorker:
             explicit_range = _list_date_range(prompt, query_now)
             if explicit_range is not None:
                 start_at, end_at = explicit_range
+            scope = _list_scope(prompt, command.get("scope"))
             todos = self.storage.list_todos(
                 self.account_id, row["sender_id"], start_at, end_at, keyword,
-                not_before=query_now,
+                not_before=query_now, scope=scope,
             )
             if not todos:
                 return "📋 该时间段没有待办事项。"

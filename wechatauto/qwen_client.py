@@ -119,6 +119,18 @@ class QwenClient:
             result["messages"] = messages
         return result
 
+    @staticmethod
+    def _normalize_json_keys(value):
+        """修复模型偶发在 JSON 字段名中插入空格的问题。"""
+        if isinstance(value, dict):
+            return {
+                re.sub(r"\s+", "", key): QwenClient._normalize_json_keys(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [QwenClient._normalize_json_keys(item) for item in value]
+        return value
+
     def _json_request(
         self,
         url: str,
@@ -257,9 +269,11 @@ class QwenClient:
             raise RuntimeError("千问意图解析未返回文本 JSON")
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
         try:
-            result = json.loads(content)
+            result = self._normalize_json_keys(json.loads(content))
         except json.JSONDecodeError as exc:
             raise RuntimeError("千问意图解析返回了无效 JSON") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("千问意图解析未返回 JSON 对象")
         if result.get("intent") not in {
             "help", "create", "list", "delete", "confirm_delete", "cancel_delete",
             "confirm_replace", "cancel_replace", "chat",

@@ -827,9 +827,21 @@ class ArchiveStorage:
             return result.rowcount > 0
 
     @staticmethod
-    def _todo_where(start_at, end_at, keyword, todo_id=None, not_before=None):
-        clauses = ["account_id=%s", "creator_id=%s", "status='active'"]
-        values = []
+    def _todo_where(
+        owner_id, start_at, end_at, keyword, todo_id=None, not_before=None,
+        scope="created",
+    ):
+        scope = scope if scope in {"all", "created", "assigned"} else "created"
+        clauses = ["account_id=%s", "status='active'"]
+        if scope == "all":
+            clauses.append("(creator_id=%s OR reminder_target_id=%s)")
+            values = [owner_id, owner_id]
+        elif scope == "assigned":
+            clauses.append("reminder_target_id=%s")
+            values = [owner_id]
+        else:
+            clauses.append("creator_id=%s")
+            values = [owner_id]
         if not_before is not None:
             day_start = not_before.replace(
                 hour=0, minute=0, second=0, microsecond=0,
@@ -862,16 +874,17 @@ class ArchiveStorage:
         limit: int = 50,
         todo_id: Optional[int] = None,
         not_before=None,
+        scope: str = "created",
     ) -> List[dict]:
         where, values = self._todo_where(
-            start_at, end_at, keyword, todo_id, not_before,
+            creator_id, start_at, end_at, keyword, todo_id, not_before, scope,
         )
         with self._connect() as conn:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
                     "SELECT * FROM wechat_todos WHERE " + where
                     + " ORDER BY event_at ASC LIMIT %s",
-                    [account_id, creator_id] + values + [limit],
+                    [account_id] + values + [limit],
                 )
                 return list(cur.fetchall())
 

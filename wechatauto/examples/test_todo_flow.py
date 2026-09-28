@@ -342,6 +342,20 @@ class TodoFlowTest(unittest.TestCase):
             ),
         )
         self.assertEqual(kwargs["not_before"], self.now)
+        self.assertEqual(kwargs["scope"], "all")
+
+    def test_list_created_scope_is_supported(self):
+        reply = self.worker._handle_command(
+            self.row,
+            {
+                "intent": "list", "scope": "created",
+                "range_start": None, "range_end": None, "keyword": None,
+            },
+            "查询我创建的待办事项",
+            self.now,
+        )
+        self.assertIn("没有待办", reply)
+        self.assertEqual(self.worker.storage.list_call[1]["scope"], "created")
 
     def test_naive_model_time_is_beijing_time(self):
         parsed = _parse_datetime("2026-09-11T19:30:00")

@@ -88,6 +88,26 @@ class QwenClientTest(unittest.TestCase):
             {"kind": "relative_days", "value": 1},
         )
 
+    def test_interpret_repairs_spaces_in_semantic_keys(self):
+        client = _FakeClient()
+        client._json_request = lambda *args, **kwargs: {
+            "choices": [{"message": {"content": (
+                '{"intent":"create","items":[{"title":"吃饭",'
+                '"date_semantic":{"k i n d":"today"},'
+                '"time_semantic":{"k i n d":"clock","h o u r":6,'
+                '"m i n u t e":30,"d a y_period":"afternoon",'
+                '"is_24_hour":false},'
+                '"reminder_semantic":{"k i n d":"before_event",'
+                '"v a l u e":30,"u n i t":"minutes"}}]}'
+            )}}],
+        }
+        result = client.interpret("今天下午六点半吃饭", "2026-09-28T16:00:00+08:00")
+        item = result["items"][0]
+        self.assertEqual(item["date_semantic"]["kind"], "today")
+        self.assertEqual(item["time_semantic"]["hour"], 6)
+        self.assertEqual(item["time_semantic"]["minute"], 30)
+        self.assertEqual(item["reminder_semantic"]["value"], 30)
+
     def test_interpret_prompt_requires_structured_time_semantics(self):
         client = _FakeClient()
         captured = {}
