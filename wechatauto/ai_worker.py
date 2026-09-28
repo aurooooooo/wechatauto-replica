@@ -8,13 +8,13 @@ import os
 import re
 import tempfile
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from wechatauto.qwen_client import (
-    QwenClient, render_prompt, reply_prompt, reply_trigger,
+    QwenBillingError, QwenClient, render_prompt, reply_prompt, reply_trigger,
 )
 from wechatauto import WeChatDB
 from wechatauto.send_text import resolve_group_member, send_text
@@ -40,6 +40,17 @@ def _parse_datetime(value):
 def _format_time(value, all_day: bool = False) -> str:
     value = value.astimezone(SHANGHAI)
     return value.strftime("%Y-%m-%d" if all_day else "%Y-%m-%d %H:%M")
+
+
+def _list_date_range(text: str, now: datetime):
+    """为明确的中文日期查询生成当天起止范围，避免依赖模型补全。"""
+    matches = re.findall(r"大后天|后天|明天|今天", text or "")
+    if len(matches) != 1:
+        return None
+    day_offset = {"今天": 0, "明天": 1, "后天": 2, "大后天": 3}[matches[0]]
+    target_date = now.date() + timedelta(days=day_offset)
+    start = datetime.combine(target_date, time.min, SHANGHAI)
+    return start, start + timedelta(days=1)
 
 
 def _format_todo(todo: dict) -> str:
@@ -173,15 +184,24 @@ class AIWorker:
         if self._thread:
             self._thread.join(timeout=5)
 
+    def _send_qwen_billing_notice(self, session_id: str) -> None:
+        try:
+            send_text(
+                session_id, render_prompt("qwen_billing_error"), self.db_dir,
+            )
+            self.log("QWEN_BILLING", "%s | 已发送充值提示" % session_id)
+        except Exception as exc:
+            self.log("QWEN_BILLING_NOTICE_ERROR", "%s：%s" % (session_id, exc))
+
     def _transcribe_one(self) -> bool:
         row = self.storage.claim_pending_asr(self.account_id)
         if not row:
             return False
         path = self.tmp_dir / ("%s.wav" % row["id"])
+        incoming = row.get("sender_id") != self.account_id
         try:
             self.storage.download_media(row["object_key"], str(path))
             transcript = self.client.transcribe_file(str(path), "audio/wav")
-            incoming = row.get("sender_id") != self.account_id
             triggered = (
                 incoming and row["session_type"] == "private"
                 and reply_trigger("private", transcript)
@@ -190,6 +210,15 @@ class AIWorker:
             self.log(
                 "ASR", "%s | %s | 转写完成，字符数=%d" % (
                     row["session_name"], row["sender_name"], len(transcript),
+                ),
+            )
+        except QwenBillingError as exc:
+            self.storage.mark_asr_failure(row["id"], str(exc))
+            if incoming:
+                self._send_qwen_billing_notice(row["session_id"])
+            self.log(
+                "ASR_ERROR", "%s/%s：%s" % (
+                    row["session_id"], row["local_id"], exc,
                 ),
             )
         except Exception as exc:
@@ -305,8 +334,17 @@ class AIWorker:
         end_at = _parse_datetime(command.get("range_end"))
         keyword = str(command.get("keyword") or "").strip() or None
         if intent == "list":
+            query_now = now or datetime.now(SHANGHAI)
+            if query_now.tzinfo is None:
+                query_now = query_now.replace(tzinfo=SHANGHAI)
+            else:
+                query_now = query_now.astimezone(SHANGHAI)
+            explicit_range = _list_date_range(prompt, query_now)
+            if explicit_range is not None:
+                start_at, end_at = explicit_range
             todos = self.storage.list_todos(
                 self.account_id, row["sender_id"], start_at, end_at, keyword,
+                not_before=query_now,
             )
             if not todos:
                 return "📋 该时间段没有待办事项。"
@@ -368,15 +406,16 @@ class AIWorker:
             pending_replace = row.get("sender_id") and self.storage.has_pending_todo_replace(
                 self.account_id, row["sender_id"], row["session_id"],
             )
+            now = datetime.now(SHANGHAI)
             if pending_replace and confirmation in {"是", "确认", "替换", "确认替换"}:
                 command = {"intent": "confirm_replace"}
             elif pending_replace and confirmation in {"否", "不", "取消", "不替换"}:
                 command = {"intent": "cancel_replace"}
             else:
                 command = self.client.interpret(
-                    prompt, datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                    prompt, now.isoformat(timespec="seconds"),
                 )
-            reply = self._handle_command(row, command, prompt)
+            reply = self._handle_command(row, command, prompt, now)
             self.storage.mark_reply_ready(row["id"], reply)
             if not self.storage.claim_ready_reply(row["id"]):
                 return True
@@ -385,6 +424,14 @@ class AIWorker:
             self.log(
                 "AUTO_REPLY", "%s | %s | 已发送，字符数=%d" % (
                     row["session_name"], row["sender_name"], len(reply),
+                ),
+            )
+        except QwenBillingError as exc:
+            self.storage.mark_reply_failure(row["id"], str(exc))
+            self._send_qwen_billing_notice(row["session_id"])
+            self.log(
+                "AUTO_REPLY_ERROR", "%s/%s：%s" % (
+                    row["session_id"], row["local_id"], exc,
                 ),
             )
         except Exception as exc:

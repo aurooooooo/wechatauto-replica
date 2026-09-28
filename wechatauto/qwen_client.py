@@ -21,6 +21,10 @@ from urllib.request import Request, urlopen
 PROMPT_FILE = Path(__file__).with_name("prompts.ini")
 
 
+class QwenBillingError(RuntimeError):
+    """千问账户余额不足或欠费。"""
+
+
 @lru_cache(maxsize=1)
 def _prompt_config() -> ConfigParser:
     config = ConfigParser(interpolation=None)
@@ -83,17 +87,52 @@ class QwenClient:
         for attempt in range(2):
             try:
                 with urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    result = json.loads(response.read().decode("utf-8"))
+                    if self._is_billing_error(result):
+                        raise QwenBillingError("千问账户余额不足或已欠费")
+                    return result
             except HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:2000]
+                if exc.code == 402 or self._is_billing_error(body):
+                    raise QwenBillingError("千问账户余额不足或已欠费") from exc
                 if attempt == 0 and (exc.code == 429 or exc.code >= 500):
                     continue
-                body = exc.read().decode("utf-8", errors="replace")[:2000]
                 raise RuntimeError("千问接口返回 HTTP %s：%s" % (exc.code, body)) from exc
             except (TimeoutError, socket.timeout, URLError) as exc:
                 if attempt == 0:
                     continue
                 raise RuntimeError("千问接口请求失败（已重试1次）：%s" % exc) from exc
         raise RuntimeError("千问接口请求失败")
+
+    @staticmethod
+    def _is_billing_error(value) -> bool:
+        if isinstance(value, dict):
+            parts = []
+            for key in ("code", "message", "type", "status"):
+                if value.get(key) is not None:
+                    parts.append(str(value[key]))
+            if isinstance(value.get("error"), dict):
+                parts.append(QwenClient._error_text(value["error"]))
+            value = " ".join(parts)
+        text = str(value).casefold().replace("-", "_")
+        markers = (
+            "arrearage", "accountoverdue", "paymentrequired",
+            "insufficientbalance", "insufficient_balance", "insufficient balance",
+            "insufficientquota", "insufficient_quota", "insufficient quota",
+            "quota_exceeded", "quota exceeded", "余额不足", "余额不够",
+            "账户欠费", "账号欠费", "欠费", "请充值", "需要充值",
+            "please recharge", "need recharge",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _error_text(value) -> str:
+        if isinstance(value, dict):
+            return " ".join(
+                str(value[key]) for key in ("code", "message", "type", "status")
+                if value.get(key) is not None
+            )
+        return str(value)
 
     def chat(self, prompt: str) -> str:
         response = self._json_request(

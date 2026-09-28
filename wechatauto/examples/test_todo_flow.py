@@ -36,6 +36,7 @@ class _Storage:
         self.create_result = None
         self.clarification = None
         self.delete_args = None
+        self.list_call = None
 
     def create_todos(self, message, items):
         self.owner = message["sender_id"]
@@ -56,8 +57,9 @@ class _Storage:
             "updated": [], "conflicts": [],
         }
 
-    def list_todos(self, account_id, creator_id, *args):
+    def list_todos(self, account_id, creator_id, *args, **kwargs):
         self.owner = creator_id
+        self.list_call = (args, kwargs)
         return []
 
     def prepare_todo_delete(self, account_id, creator_id, session_id, *args):
@@ -118,6 +120,14 @@ class TodoFlowTest(unittest.TestCase):
         self.assertIn("我能帮你做这些事", reply)
         self.assertIn("同一个提醒对象在同一时间", reply)
         self.assertIn("普通问题可以直接询问我", reply)
+
+    def test_qwen_billing_notice_contains_recharge_url(self):
+        with patch("wechatauto.ai_worker.send_text") as mocked:
+            self.worker._send_qwen_billing_notice("room@chatroom")
+        self.assertIn(
+            "https://platform.qianwenai.com/home",
+            mocked.call_args.args[1],
+        )
 
     def test_create_returns_structured_overview_for_creator(self):
         reply = self.worker._handle_command(self.row, {
@@ -306,6 +316,29 @@ class TodoFlowTest(unittest.TestCase):
         }, "")
         self.assertEqual(self.worker.storage.owner, "user_wxid")
         self.assertIn("没有待办", reply)
+
+    def test_list_tomorrow_uses_only_tomorrow_and_current_time_cutoff(self):
+        reply = self.worker._handle_command(
+            self.row,
+            {
+                "intent": "list",
+                "range_start": "2026-09-10T00:00:00+08:00",
+                "range_end": "2026-09-11T00:00:00+08:00",
+                "keyword": None,
+            },
+            "明天有没有什么事情？",
+            self.now,
+        )
+        self.assertIn("没有待办", reply)
+        args, kwargs = self.worker.storage.list_call
+        self.assertEqual(
+            args[:2],
+            (
+                _parse_datetime("2026-09-11T00:00:00+08:00"),
+                _parse_datetime("2026-09-12T00:00:00+08:00"),
+            ),
+        )
+        self.assertEqual(kwargs["not_before"], self.now)
 
     def test_naive_model_time_is_beijing_time(self):
         parsed = _parse_datetime("2026-09-11T19:30:00")

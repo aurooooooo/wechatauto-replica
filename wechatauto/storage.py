@@ -827,9 +827,17 @@ class ArchiveStorage:
             return result.rowcount > 0
 
     @staticmethod
-    def _todo_where(start_at, end_at, keyword, todo_id=None):
+    def _todo_where(start_at, end_at, keyword, todo_id=None, not_before=None):
         clauses = ["account_id=%s", "creator_id=%s", "status='active'"]
         values = []
+        if not_before is not None:
+            day_start = not_before.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+            clauses.append(
+                "(event_at >= %s OR (event_all_day AND event_at >= %s))"
+            )
+            values.extend((not_before, day_start))
         if start_at is not None:
             clauses.append("event_at >= %s")
             values.append(start_at)
@@ -853,8 +861,11 @@ class ArchiveStorage:
         keyword: Optional[str] = None,
         limit: int = 50,
         todo_id: Optional[int] = None,
+        not_before=None,
     ) -> List[dict]:
-        where, values = self._todo_where(start_at, end_at, keyword, todo_id)
+        where, values = self._todo_where(
+            start_at, end_at, keyword, todo_id, not_before,
+        )
         with self._connect() as conn:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(

@@ -7,7 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wechatauto.qwen_client import PROMPT_FILE, QwenClient, render_prompt
+from wechatauto.qwen_client import (
+    PROMPT_FILE, QwenBillingError, QwenClient, render_prompt,
+)
 
 
 class _FakeClient(QwenClient):
@@ -122,6 +124,16 @@ class QwenClientTest(unittest.TestCase):
         self.assertIn("我能帮你做这些事", help_text)
         self.assertIn("删除编号12的待办", help_text)
         self.assertIn("提前30分钟", help_text)
+
+    def test_billing_errors_are_recognized(self):
+        self.assertTrue(QwenClient._is_billing_error({"code": "Arrearage"}))
+        self.assertTrue(QwenClient._is_billing_error("余额不足，请充值"))
+        self.assertFalse(QwenClient._is_billing_error("请求超时"))
+        self.assertTrue(issubclass(QwenBillingError, RuntimeError))
+
+    def test_billing_prompt_contains_recharge_url(self):
+        message = render_prompt("qwen_billing_error")
+        self.assertIn("https://platform.qianwenai.com/home", message)
 
     def test_json_request_retries_one_timeout(self):
         class _Response:
